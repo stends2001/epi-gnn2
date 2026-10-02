@@ -135,10 +135,10 @@ class EpiConfig:
     split_valtest : str = '2019-06-01'
     
     # ============= GEOGRAPHY =============
-    country : str = 'germany'
     level : AdminLevel = 'nuts3'
     
     # ============= TASK =============
+    quantiles : list[float] | None = None
     horizon_size : int = 1
     horizon_leadtime : int = 1
     
@@ -167,7 +167,7 @@ class EpiConfig:
 
     # ============= DUNDER ============ #
     def __post_init__(self):
-        
+        self.country = 'germany'
         # set pathmanager
         self.path_manager   = EpiPathsManager(self.country, self.level, self.disease)
         
@@ -236,7 +236,7 @@ class EpiConfig:
     # ============= ATTRIBUTE ORGANIZATION ==============
     def _set_hidden_attributes(self) -> None:
         """post validation, sets hidden attributes that should be accessed (and are not available in representation)"""
-        self._num_quantiles = 0
+        self._num_quantiles = None if self.quantiles is None else len(self.quantiles)
 
     def _classify_attributes(self) -> None:
         """creates dictionaries of attributes and classifies those. Used for back-end and for interaction with repr/str dunders"""
@@ -246,8 +246,8 @@ class EpiConfig:
         self.attributes_classified_dict = {
             'main'          :   ['disease'],
             'temporal'      :   ['temporal_frequency','min_date','max_date','split_trainval','split_valtest'],
-            'geography'     :   ['country','level'],
-            'task'          :   ['horizon_size','horizon_leadtime'],
+            'geography'     :   ['level'],
+            'task'          :   ['quantiles','horizon_size','horizon_leadtime'],
             'features'      :   ['time_index_d','time_index_w','time_index_m','lag_column','lag_num','sequence_length','incidence_scalar', 'feature_popsize','feature_popdens'],
             'normalization' :   ['normalization_method','log_transform','log_shift'],    
             'column_names'  :   ['temporal_column','target_column','id_column','pred_column'],
