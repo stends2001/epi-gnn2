@@ -154,15 +154,11 @@ class PredictionManager:
             - if num_qunatiles = 0 => only 'pred'
             - else all registered pred columns except for 'pred'
         """        
-        cols        = [self.epiconfig.temporal_column, self.epiconfig.id_column, 'target']
+        pred_cols          = self.column_registration.pred_columns
+        
+        context_cols        = [self.epiconfig.temporal_column, self.epiconfig.id_column, 'target']
 
-        if self.epiconfig._num_quantiles == 0:
-            pred_cols= ['pred']
-        else:
-            pred_cols= [c for c in self.column_registration.pred_columns if c != 'pred']
-
-        self.pred_cols          = pred_cols
-        self.required_columns   = cols + pred_cols
+        self.required_columns   = context_cols + pred_cols
 
     def _shift_prediction_timestamp(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -180,9 +176,7 @@ class PredictionManager:
         """
         dfc                                 = df.copy()
 
-        if self.epiconfig.temporal_frequency == 'd':
-            delta = timedelta(days=self.epiconfig.horizon_leadtime)
-        elif self.epiconfig.temporal_frequency == 'w':
+        if self.epiconfig.temporal_frequency == 'w':
             delta = timedelta(weeks=self.epiconfig.horizon_leadtime)
         elif self.epiconfig.temporal_frequency == 'm':
             delta = relativedelta(months=self.epiconfig.horizon_leadtime)
@@ -336,7 +330,7 @@ class PredictionManager:
             converts to cases, sums nationally, divides by total population.
         """
         dfc = df.copy()
-        columns_to_aggregate = self.pred_cols + ['target']
+        columns_to_aggregate = self.column_registration.pred_columns + ['target']
         temporal_col = self.epiconfig.temporal_column
 
         if self.epiconfig.target_column == 'cases':
