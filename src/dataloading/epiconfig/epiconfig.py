@@ -10,7 +10,7 @@ from .pathmanager import EpiPathsManager
 from .validator import EpiConfigValidator
 from .exceptions import EpiConfigValidationError, IncompatibleEpiConfigs
 
-from ...utils import align, return_header_line, AdminLevel, Disease, InvalidExtension
+from ...utils import align, return_header_line, AdminLevel, Disease, InvalidExtension, Country
 
 import logging
 logger = logging.getLogger(__name__)
@@ -136,6 +136,7 @@ class EpiConfig:
     
     # ============= GEOGRAPHY =============
     level : AdminLevel = 'nuts3'
+    country : Country = 'germany'
     
     # ============= TASK =============
     quantiles : list[float] | None = None
@@ -167,14 +168,14 @@ class EpiConfig:
 
     # ============= DUNDER ============ #
     def __post_init__(self):
-        self.country = 'germany'
+        self._set_hidden_attributes()        
+        
         # set pathmanager
         self.path_manager   = EpiPathsManager(self.country, self.level, self.disease)
         
         self.validator      = EpiConfigValidator(self)
         self.validator.validate()
 
-        self._set_hidden_attributes()
         self._classify_attributes()
 
         logger.debug('EpiConfig has been created')           
@@ -237,11 +238,11 @@ class EpiConfig:
     def _set_hidden_attributes(self) -> None:
         """post validation, sets hidden attributes that should be accessed (and are not available in representation)"""
         if self.quantiles is None : 
-            self.predictions_mode : Literal['point','interval'] = 'point'
+            self._prediction_mode : Literal['point','interval'] = 'point'
             self._num_quantiles = None 
 
         else:
-            self.predictions_mode : Literal['point','interval'] = 'interval'
+            self._prediction_mode : Literal['point','interval'] = 'interval'
             self._num_quantiles = len(self.quantiles)
 
     def _classify_attributes(self) -> None:
@@ -252,8 +253,8 @@ class EpiConfig:
         self.attributes_classified_dict = {
             'main'          :   ['disease'],
             'temporal'      :   ['temporal_frequency','min_date','max_date','split_trainval','split_valtest'],
-            'geography'     :   ['level'],
-            'task'          :   ['quantiles','horizon_size','horizon_leadtime'],
+            'geography'     :   ['level', 'country'],
+            'task'          :   ['quantiles','horizon_size','horizon_leadtime','predict_prediction_modeion_mode'],
             'features'      :   ['time_index_d','time_index_w','time_index_m','lag_column','lag_num','sequence_length','incidence_scalar', 'feature_popsize','feature_popdens'],
             'normalization' :   ['normalization_method','log_transform','log_shift'],    
             'column_names'  :   ['temporal_column','target_column','id_column','pred_column'],
