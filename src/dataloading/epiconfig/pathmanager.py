@@ -2,7 +2,7 @@ from typing import Callable
 from pathlib import Path
 import inspect
 
-from ...utils import PathManager, Country, AdminLevel, Disease
+from ...utils import PathManager, AdminLevel, Disease, Country
 
 def registered_property(func: Callable) -> Callable:
     """
