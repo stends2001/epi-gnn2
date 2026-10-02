@@ -10,7 +10,7 @@ from .pathmanager import EpiPathsManager
 from .validator import EpiConfigValidator
 from .exceptions import EpiConfigValidationError, IncompatibleEpiConfigs
 
-from ...utils import align, return_header_line, Country, AdminLevel, Disease, InvalidExtension
+from ...utils import align, return_header_line, AdminLevel, Disease, InvalidExtension
 
 import logging
 logger = logging.getLogger(__name__)
@@ -135,7 +135,7 @@ class EpiConfig:
     split_valtest : str = '2019-06-01'
     
     # ============= GEOGRAPHY =============
-    country : Country = 'germany'
+    country : str = 'germany'
     level : AdminLevel = 'nuts3'
     
     # ============= TASK =============
