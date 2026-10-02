@@ -34,30 +34,36 @@ class Persistence(BaseLineModel):
             return df[self.epiconfig.temporal_column].dt.month
         else:
             raise ValueError(f'Invalid temporal frequency found for ClimaScale model: {freq}')
-
-    def _compute_residual_quantiles(self, dataset: str) -> dict[int, pd.DataFrame]:
+    
+    def _compute_residual_quantiles(self, dataset: DataSetSplit | list[DataSetSplit]) -> dict[int, pd.DataFrame]:
         """
         Per-horizon residual quantiles based on column 'pred', keyed by horizon.
         Each value is a DataFrame indexed by seasonal index, columned by quantile.
+
+        ``dataset`` may be a single split or a list of splits (e.g.
+        ``['train', 'val']``) to pool residuals across more than one —
+        legitimate for Persistence specifically, since it has no fitted
+        parameters and therefore no optimism-bias risk from including
+        train in its own calibration pool.
         """
-        quantiles       = self.databuilder.dataorchestrator.config.quantiles
+        quantiles        = self.databuilder.dataorchestrator.config.quantiles
         horizon_leadtime = self.databuilder.dataorchestrator.config.horizon_leadtime
-        horizon_size    = self.databuilder.dataorchestrator.config.horizon_size
+        horizon_size     = self.databuilder.dataorchestrator.config.horizon_size
+
+        split_cols = [dataset] if isinstance(dataset, str) else dataset
 
         tables: dict[int, pd.DataFrame] = {}
 
         for hh in range(horizon_size):
             timeshift_num = int(hh + horizon_leadtime)
 
-            # shift on the FULL series first (matches forecast()'s order),
-            # so val's boundary-adjacent rows still get a valid shifted value
             df = self.databuilder.dataloader_main
             df = df.sort_values([self.epiconfig.id_column, self.epiconfig.temporal_column]).copy()
 
             df['pred'] = df.groupby(self.epiconfig.id_column)['target'].shift(timeshift_num)
 
-            # filter to split AFTER shifting
-            df = df[df[dataset]].dropna(subset=['pred', 'target'])
+            # filter to the pooled split(s) AFTER shifting
+            df = df[df[split_cols].any(axis=1)].dropna(subset=['pred', 'target'])
 
             residuals = df['target'] - df['pred']
             t_idx     = self._get_seasonal_index(df)
@@ -77,7 +83,7 @@ class Persistence(BaseLineModel):
         assert isinstance(self.databuilder, BaseLineDataBuilder)
 
         if self.epiconfig._prediction_mode == 'interval':
-            self._residual_quantiles = self._compute_residual_quantiles('val')
+            self._residual_quantiles = self._compute_residual_quantiles(['train','val'])
 
         for hh in range(self.databuilder.dataorchestrator.config.horizon_size):
 
