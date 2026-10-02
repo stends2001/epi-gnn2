@@ -236,7 +236,13 @@ class EpiConfig:
     # ============= ATTRIBUTE ORGANIZATION ==============
     def _set_hidden_attributes(self) -> None:
         """post validation, sets hidden attributes that should be accessed (and are not available in representation)"""
-        self._num_quantiles = None if self.quantiles is None else len(self.quantiles)
+        if self.quantiles is None : 
+            self.predictions_mode : Literal['point','interval'] = 'point'
+            self._num_quantiles = None 
+
+        else:
+            self.predictions_mode : Literal['point','interval'] = 'interval'
+            self._num_quantiles = len(self.quantiles)
 
     def _classify_attributes(self) -> None:
         """creates dictionaries of attributes and classifies those. Used for back-end and for interaction with repr/str dunders"""
