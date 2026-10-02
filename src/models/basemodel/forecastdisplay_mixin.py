@@ -101,7 +101,11 @@ class ForecastDisplayMixin:
             self._draw_target_on_ax(df_node, ax)
         
             # draw predictions
-            self._draw_preds_on_ax(df_node, ax)            
+            if self.epiconfig._prediction_mode =='point':
+                self._draw_point_preds_on_ax(df_node, ax)   
+            
+            elif self.epiconfig._prediction_mode =='interval':        
+                self._draw_interval_preds_on_ax(df_node, ax)  
 
             # basic make up of ax
             self._make_up_ax(xlimits, ax_title, ax)
@@ -162,8 +166,10 @@ class ForecastDisplayMixin:
 
         return nodes_list, df_pred, df_pred_aggr
     
-    def _draw_preds_on_ax(self, df_node: pd.DataFrame, ax: Axes):
+    def _draw_point_preds_on_ax(self, df_node: pd.DataFrame, ax: Axes):
         """plots predictions (single line for point preds) on given ax."""
+        assert self.epiconfig.quantiles == None
+        assert self.epiconfig._num_quantiles == None        
         # single line: center col
         sns.lineplot(data           = df_node, 
                     x               = self.epiconfig.temporal_column, 
@@ -178,6 +184,39 @@ class ForecastDisplayMixin:
                 # adjust some color-aspects if color is light
                 markeredgecolor = 'black' if color_is_light(self.model_color) else 'white',
                 )        
+
+    def _draw_interval_preds_on_ax(self, df_node: pd.DataFrame, ax: Axes):
+        """plots predictions (single line for point preds) on given ax."""
+        # single line: center col
+        assert self.epiconfig.quantiles != None
+        assert self.epiconfig._num_quantiles != None
+        
+        num_quantiles = self.epiconfig._num_quantiles
+        mid_point     = num_quantiles // 2
+        mid_point_col = self.column_registration.pred_columns[mid_point]
+        q1_col, qN_col= self.column_registration.pred_columns[0], self.column_registration.pred_columns[-1]
+
+        interval_label = f"q{self.epiconfig.quantiles[0]} - q{self.epiconfig.quantiles[-1]}"
+
+        sns.lineplot(data           = df_node, 
+                    x               = self.epiconfig.temporal_column, 
+                    y               = mid_point_col, 
+                    color           = self.model_color, 
+                    marker          = 'o', 
+                    ax              = ax, 
+                    linewidth       = 2, 
+                    markeredgewidth = 0.3,
+
+                # adjust some color-aspects if color is light
+                markeredgecolor = 'black' if color_is_light(self.model_color) else 'white',
+                )             
+
+        ax.fill_between(x   = df_node[self.epiconfig.temporal_column],
+                        y1  = df_node[q1_col],
+                        y2  = df_node[qN_col],
+                        color = self.model_color,
+                        label = interval_label,
+                        alpha = 0.4)
 
     def _draw_target_on_ax(self, df_node: pd.DataFrame, ax: Axes):
         """plots targets in single line on given ax."""        
