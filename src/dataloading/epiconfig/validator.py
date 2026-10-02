@@ -44,6 +44,7 @@ class EpiConfigValidator:
     def validate(self):
         exceptions: list[Exception] = []
         exceptions = self._datapaths(exceptions)
+        exceptions = self._quantiles(exceptions)        
         exceptions = self._current_limitations(exceptions)      
         exceptions = self._input(exceptions)  
         
@@ -65,6 +66,42 @@ class EpiConfigValidator:
 
         return exceptions        
     
+    def _quantiles(self, exceptions : list[Exception]) -> list[Exception]:
+        
+        if self.epiconfig._prediction_mode == 'point':
+            
+            if self.epiconfig.quantiles is not None:
+                exceptions.append(EpiConfigValidationError(f'``_prediction_mode`` == "point". Excpected ``quantiles`` as ``None`` but got {self.epiconfig.quantiles}')) 
+
+            if self.epiconfig._num_quantiles is not None:
+                exceptions.append(EpiConfigValidationError(f'``_prediction_mode`` == "point". Excpected ``_num_quantiles`` as ``None`` but got {self.epiconfig._num_quantiles}')) 
+
+        elif self.epiconfig._prediction_mode == 'interval':
+
+            if self.epiconfig.quantiles is None:
+                exceptions.append(EpiConfigValidationError(f'``_prediction_mode`` == "interval". Excpected ``quantiles`` as list of floats but got ``None``')) 
+
+            else:
+                for q in self.epiconfig.quantiles:
+
+                    if q <= 0 or q >= 1:
+                        exceptions.append(EpiConfigValidationError(f'Quantiles must be decimals: between 0 and 1. Got {q}')) 
+
+                n_intervals = len(self.epiconfig.quantiles) // 2
+                mid = n_intervals
+
+                if self.epiconfig.quantiles[mid] != 0.5:
+                    exceptions.append(EpiConfigValidationError(f'Number of quantiles must be an odd number centered around 0.5.'))                     
+
+            if self.epiconfig._num_quantiles is None:
+                exceptions.append(EpiConfigValidationError(f'``_prediction_mode`` == "interval". Excpected ``_num_quantiles`` as integer but got ``None``')) 
+
+            else:
+                if self.epiconfig._num_quantiles % 2 == 0:
+                    exceptions.append(EpiConfigValidationError(f'Number of quantiles must be an odd number centered around 0.5.')) 
+
+        return exceptions
+
     def _current_limitations(self, exceptions: list[Exception]) -> list[Exception]:
         """
         Validates any issues in the initialization of an EpiConfig instance. 
