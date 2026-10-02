@@ -36,8 +36,8 @@ class BaseModel(ModelStatusMixin,
         Data-orchestration container for context data.
     ``temporal_summary``
         Helper class that stores temporal information, built based on ``EpiConfig``.
-    ``pred_col``
-        Column name under which predictions are stored.
+    ``prediction_columns``
+        Column names under which predictions are stored. When prediction quantiles, ``['pred_q1', ..., 'pred_qN']``. Else ``['pred']``.
 
     ``model_color``
         Color of the model's predictions.
@@ -110,7 +110,7 @@ class BaseModel(ModelStatusMixin,
         self.column_registration = databuilder.dataorchestrator.column_registration
         self.context_data = databuilder.dataorchestrator.data_context
         self.temporal_summary = self.context_data.temporal_summary
-        self.pred_col = self.epiconfig.pred_column
+        self.prediction_columns = self.column_registration.get_entries_names_by_type('pred')
 
     def _validate_databuilder(self):
         """validate class of databuilder"""
