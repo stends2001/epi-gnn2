@@ -77,7 +77,7 @@ class BaseLineModel(BaseModel):
         if params is None:
             return df.copy()
 
-        columns       = ['target'] + [self.pred_col]
+        columns       = ['target'] + self.prediction_columns
         df_transformed = df.copy()
 
         for col in columns:
