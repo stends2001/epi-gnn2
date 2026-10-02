@@ -108,7 +108,7 @@ class Persistence(BaseLineModel):
 
                 for i, q in enumerate(self.epiconfig.quantiles):
                     offset = t_idx.map(horizon_table[q])
-                    evaluation_df[f'pred_q{i+1}'] = persistence_pred + offset
+                    evaluation_df[f'pred_q{i+1}'] = (persistence_pred + offset).clip(lower=0)
 
            # filter on dataset train/val/test
             evaluation_df = evaluation_df[evaluation_df[dataset]]
