@@ -42,23 +42,7 @@ class EpiDataFinalizer:
                  column_registration : ColumnRegistry):
         
         self.epiconfig = epiconfig 
-        self.column_registration = column_registration
-
-    def _create_pred_col_entry(self):
-        """
-        while pred doesn't exist in the data, models will end up with these columns.
-        if prediction_quantiles are inputted in EpiConfig, these will be created here.
-        """
-
-        needs_normalization  = False if self.epiconfig.target_column == 'cases' else True
-        transformation_group = 'target'if self.epiconfig.target_column != 'cases' else None
-
-        self.column_registration.add_column(
-            'pred',
-            'pred',
-            transformation = needs_normalization,
-            transformation_group = transformation_group
-        )                   
+        self.column_registration = column_registration                  
 
     def _add_horizons(self, df: pd.DataFrame) -> pd.DataFrame:
         """adds target columns when horizon_size>1"""
@@ -133,6 +117,30 @@ class EpiDataFinalizer:
 
         return dfc
 
+    def _create_pred_col_entry(self):
+
+        if self.epiconfig._prediction_mode == 'point':
+            self.column_registration.add_column(
+                'pred',
+                'pred',
+                True,
+                'target'
+            )
+
+        elif self.epiconfig._prediction_mode == 'interval':
+
+            if self.epiconfig._num_quantiles is None:
+                raise ValueError('Expected num quantiles to be int, got None')
+
+            for q in range(self.epiconfig._num_quantiles):
+                self.column_registration.add_column(
+                    f'pred_q{q+1}',
+                    'pred',
+                    True,
+                    'target'
+                )
+
+
     def orchestrate(self, normalized_data: TransformedEpiData) -> 'FinalizedEpiData':
         time_start = time.time()
         dfc         = normalized_data.data
@@ -142,7 +150,8 @@ class EpiDataFinalizer:
     
         dfc_normalized_nanfree      = self._drop_nans(dfc)
         dfc_denormalized_nanfree    = self._denormalize(dfc_normalized_nanfree) 
-
+        
+    
         time_end = time.time()
 
         time_elapsed = time_end - time_start
