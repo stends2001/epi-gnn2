@@ -1,1 +1,1 @@
-from .modelarchitectures import GCNModel, GATModel
+from .modelarchitectures import GCNModel, GATModel, HHH4Model
