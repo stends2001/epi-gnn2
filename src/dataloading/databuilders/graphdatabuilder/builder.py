@@ -209,6 +209,18 @@ class GraphDataBuilder:
         self._graphmode = 'static'
         return self
 
+    def use_graph(self, graph: GraphStructure) -> 'GraphDataBuilder':
+        """
+        Use a given graph structure instead of loading one from file, e.g. a
+        control graph from ``graphconstruction.controls``. Call before ``build()``.
+        """
+        if graph.num_nodes != self.dataorchestrator.data_context.num_nodes:
+            raise ValueError(f'graph has {graph.num_nodes} nodes, data has '
+                             f'{self.dataorchestrator.data_context.num_nodes}')
+        self.graph      = graph
+        self._graphmode = 'static'
+        return self
+
     @property 
     def dataloader_main(self) -> 'DataList':
         if self._dataloader_main is None:

@@ -11,3 +11,4 @@ from .graphbuilding import GraphManager
 
 import logging
 logging.getLogger(__name__).addHandler(logging.NullHandler())
+from .controls import identity_graph, rewired_graph, complete_graph, degree_sequence
