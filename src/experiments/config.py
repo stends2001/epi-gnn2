@@ -22,9 +22,13 @@ TASKS = ('baselines', 'hhh4', 'graph_controls', 'compare_diseases')
 # keys passed straight to HHH4Model.set_model_hparams / set_global_hparams
 MODEL_KEYS = {'hidden_size', 'num_layers', 'dropout', 'norm_edges', 'alpha_mode',
               'incidence_features', 'endemic_features', 'init_from_train', 'endemic_mode',
-              'node_effects', 'node_penalty', 'neighbourhood_mode', 'epidemic_mode'}
+              'node_effects', 'node_penalty', 'neighbourhood_mode', 'epidemic_mode',
+              'seasonal_rates', 'rate_dynamics', 'dynamics_hidden', 'max_log_rate_adj',
+              'dynamics_penalty'}
 TRAIN_KEYS = {'lr', 'n_epochs', 'patience', 'min_delta', 'optimizer', 'scheduler',
-              'optimizer_kwargs', 'scheduler_kwargs'}
+              'optimizer_kwargs', 'scheduler_kwargs', 'shuffle'}
+# train keys handled by the runner itself, not passed to set_global_hparams
+RUNNER_TRAIN_KEYS = {'seeds', 'calibrate_dispersion'}
 
 
 class ConfigError(ValueError):
@@ -109,9 +113,9 @@ def validate(cfg: dict) -> None:
     bad_model = set(cfg.get('model', {})) - MODEL_KEYS
     if bad_model:
         errors.append(f'unknown model keys {sorted(bad_model)}; allowed: {sorted(MODEL_KEYS)}')
-    bad_train = set(cfg.get('train', {})) - TRAIN_KEYS - {'seeds'}
+    bad_train = set(cfg.get('train', {})) - TRAIN_KEYS - RUNNER_TRAIN_KEYS
     if bad_train:
-        errors.append(f'unknown train keys {sorted(bad_train)}; allowed: {sorted(TRAIN_KEYS | {"seeds"})}')
+        errors.append(f'unknown train keys {sorted(bad_train)}; allowed: {sorted(TRAIN_KEYS | RUNNER_TRAIN_KEYS)}')
 
     seeds = cfg.get('train', {}).get('seeds', [0])
     if not isinstance(seeds, list) or not seeds:

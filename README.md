@@ -104,6 +104,20 @@ neighbourhood_i = phi_i    * (lag-weighted mean of neighbours' cases, self-loops
   coefficients on the week-of-year sin/cos features, so its own peak week and
   amplitude. Node deviations are centred and ridge-penalised (`node_penalty`),
   pooling regions with little data towards the shared curve.
+- **Time-varying rates:** the rates also get week-of-year terms, and a GRU
+  (or LSTM, `rate_dynamics`) reads the recent trajectory of own and neighbour
+  counts and shifts both rates per region and week, bounded and starting at 0.
+  This lets the model follow epidemics that grow several-fold within the lead time
+  and then collapse (influenza). On simulated influenza-like seasons (lead 4,
+  three test seasons) WIS dropped from 3.23 (constant rates) to 2.29 (seasonal
+  terms) and 2.06 (GRU). `forecast_components` reports the weekly rate
+  multipliers; `plot_rate_multipliers` shows them.
+- **Interval calibration:** `calibrate_dispersion()` picks one multiplier for the
+  NB dispersion that minimises the in-season WIS on the validation split
+  (`train.calibrate_dispersion: true` in the configs).
+- **Seeds:** with `train.shuffle: true` the training weeks are visited in a new
+  seeded order every epoch. Without it the rate-form model trains identically for
+  every seed.
 - **Rates:** `lambda_i`, `phi_i` are a shared rate times a node effect. The neural
   alternatives (`epidemic_mode='neural'`, `neighbourhood_mode='linear'|'gcn'`) are
   kept, but on simulated data with real spread between regions they let the

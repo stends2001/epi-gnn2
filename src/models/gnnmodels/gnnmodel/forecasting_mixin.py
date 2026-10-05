@@ -191,7 +191,7 @@ class GNNModelForecastMixin:
         """Convert raw output to [T, N, H, C] with C = 1 (point) or Q (quantiles)."""
         if self.output_head == 'nb':
             assert isinstance(raw, tuple)
-            mu, alpha = raw[0].numpy(), raw[1].numpy()
+            mu, alpha = raw[0].numpy(), raw[1].numpy() * getattr(self, 'alpha_scale', 1.0)
             if self.epiconfig._prediction_mode == 'interval':
                 from ..architectures.modules.hhh4module import nb_quantiles
                 return nb_quantiles(mu, alpha, self.epiconfig.quantiles)

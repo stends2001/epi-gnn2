@@ -80,6 +80,9 @@ class Runner:
         m.set_model_hparams(**{k: v for k, v in self.cfg.get('model', {}).items() if k in MODEL_KEYS})
         m.set_global_hparams(**{k: v for k, v in self.cfg.get('train', {}).items() if k in TRAIN_KEYS})
         m.train()
+        if self.cfg.get('train', {}).get('calibrate_dispersion', False):
+            m.dispersion_calibration = m.calibrate_dispersion('val', season=self.cfg.get('evaluation', {}).get('season', 'in'))
+            print(f'   dispersion scale chosen on val: x{m.alpha_scale:.3g}')
         m.forecast('test')
         return m
 
@@ -186,6 +189,14 @@ class Runner:
         self._table(scores, 'scores_in_season')
         self._note_scores(scores, f'seed {seeds[0]}, in season')
 
+        cal = getattr(m, 'dispersion_calibration', None)
+        if cal is not None:
+            self._table(cal, 'dispersion_calibration_val', show=False)
+            best = cal.loc[cal['wis'].idxmin()]
+            one = cal.iloc[(cal['alpha_scale'] - 1).abs().argmin()]
+            self.summary.append(
+                f"dispersion scale x{m.alpha_scale:.3g} (val in-season WIS {one['wis']:.3f} -> {best['wis']:.3f})")
+
         self._sanity(m, baselines)
         comp = dg.component_table(m)
         self._table(comp, 'components')
@@ -203,6 +214,8 @@ class Runner:
             nodes = ev.get('nodes_to_plot', [0, 1, 2])
             self._fig(dg.plot_decomposition(m, nodes=nodes), 'decomposition')
             self._fig(dg.plot_component_shares(m), 'component_shares')
+            with contextlib.suppress(ValueError):
+                self._fig(dg.plot_rate_multipliers(m, nodes=nodes), 'rate_multipliers')
             self._fig(dg.plot_node_maps(m), 'node_maps')
             with contextlib.suppress(ValueError):
                 self._fig(dg.plot_seasonal_curves(m), 'seasonal_curves')

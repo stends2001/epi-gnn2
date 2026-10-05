@@ -36,6 +36,7 @@ class GNNModelGlobalhParamsMixin:
                            optimizer_kwargs: dict[str, Any] | None = None,                           
                            scheduler_kwargs: dict[str, Any] | None = None,                    
                            loss_kwargs:     dict[str, Any] | None = None,
+                           shuffle:         bool            = False,
                            ) -> None:
         """
         Prepares model for training by setting global hyperparameters.
@@ -65,6 +66,10 @@ class GNNModelGlobalhParamsMixin:
         loss_kwargs: Optional[Dict[str, Any]] = None
             kwargs for the loss class. For ``'pinball'``, ``quantiles`` defaults to
             ``EpiConfig.quantiles``.
+        shuffle: bool = False
+            Visit the training weeks in a new random order every epoch (seeded via
+            ``torch.manual_seed``). Without it, a model without random
+            initialisation trains identically for every seed.
         """
         self._check_status(['model_hparams_set'])
 
@@ -81,13 +86,15 @@ class GNNModelGlobalhParamsMixin:
 
             'optimizer_kwargs'  : optimizer_kwargs,
             'scheduler_kwargs'  : scheduler_kwargs,
-            'loss_kwargs'       : loss_kwargs
+            'loss_kwargs'       : loss_kwargs,
+            'shuffle'           : shuffle
         }
         
         # ==== CONSTANTS ===== #
         self.n_epochs           = n_epochs
         self.patience           = patience
         self.min_delta          = min_delta
+        self.shuffle_train      = shuffle
 
         # ==== LOSS ==== #
         self.loss       = LossManager(loss, **loss_kwargs)  

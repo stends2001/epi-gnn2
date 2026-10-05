@@ -82,7 +82,14 @@ class GNNModelTrainMixin:
             # ======================== TRAINING PHASE ========================
             total_loss = 0
             
-            for snapshot in train_loader:
+            # optional shuffling of the training weeks (seeded through torch's RNG),
+            # so that different seeds give different training runs
+            if getattr(self, 'shuffle_train', False):
+                epoch_batches = [train_loader[i] for i in torch.randperm(len(train_loader)).tolist()]
+            else:
+                epoch_batches = train_loader
+
+            for snapshot in epoch_batches:
                 snapshot = snapshot.to(self.device)
 
                 # different models have different input and output in steps

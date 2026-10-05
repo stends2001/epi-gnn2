@@ -36,11 +36,16 @@ model:                     # HHH4Model.set_model_hparams
   neighbourhood_mode: rate
   node_effects: true
   node_penalty: 0.01
+  seasonal_rates: true     # week-of-year terms on the epidemic / neighbourhood rates
+  rate_dynamics: gru       # none | gru | lstm: recurrent, trajectory-driven rate shifts
+  dynamics_hidden: 16
 
 train:                     # HHH4Model.set_global_hparams, plus seeds
   lr: 0.005
   n_epochs: 300
   patience: 30
+  shuffle: true            # new training order every epoch, so seeds differ
+  calibrate_dispersion: true   # rescale NB spread to minimise val in-season WIS
   seeds: [0]
 
 evaluation:
