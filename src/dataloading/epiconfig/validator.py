@@ -145,6 +145,26 @@ class EpiConfigValidator:
         if self.epiconfig.lag_num < 1:
             exceptions.append(EpiConfigValidationError(f"number of lags must be >= 1, got {self.epiconfig.lag_num}"))
 
+        # target / lag columns
+        if self.epiconfig.target_column not in ('incidence', 'cases'):
+            exceptions.append(EpiConfigValidationError(
+                f"target_column must be 'incidence' or 'cases', got {self.epiconfig.target_column!r}"))
+
+        if self.epiconfig.lag_column not in ('incidence', 'cases'):
+            exceptions.append(EpiConfigValidationError(
+                f"lag_column must be 'incidence' or 'cases', got {self.epiconfig.lag_column!r}"))
+
+        # the cases column is dropped in processing when the target is incidence
+        if self.epiconfig.target_column == 'incidence' and self.epiconfig.lag_column == 'cases':
+            exceptions.append(EpiConfigValidationError(
+                "lag_column='cases' needs target_column='cases' (cases are dropped for incidence targets)."))
+
+        # case counts are kept on the raw scale for count likelihoods
+        if self.epiconfig.target_column == 'cases' and 'cases' in (self.epiconfig.log_transform or []):
+            exceptions.append(EpiConfigValidationError(
+                "target_column='cases' is kept untransformed; remove 'cases' from log_transform. "
+                "Lag features of cases follow the target and stay raw too."))
+
 
         # country-related
         match (self.epiconfig.country, self.epiconfig.level):

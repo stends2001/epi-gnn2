@@ -95,11 +95,14 @@ class EpiDataOrchestrator:
             self.config.id_column, 
             'context'
         )   
+        # Case counts stay on their raw scale (count likelihoods such as the NB need
+        # them untransformed); incidence follows the configured log / normalisation.
+        target_is_counts = self.config.target_column == 'cases'
         self.column_registration.add_column(
             'target', 
             'target',
-            transformation =  True,
-            transformation_group = 'self'
+            transformation =  not target_is_counts,
+            transformation_group = None if target_is_counts else 'self'
         )   
 
         # Store results at each stage
