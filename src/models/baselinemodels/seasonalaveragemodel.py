@@ -1,9 +1,10 @@
 import pandas as pd 
+import numpy as np
 
 from ...dataloading.databuilders import BaseLineDataBuilder 
-from ...utils import DataSetSplit
-
 from .baselinemodel import BaseLineModel 
+
+from ...utils import DataSetSplit
 
 class SeasonalAverage(BaseLineModel):
     """ 
@@ -22,58 +23,60 @@ class SeasonalAverage(BaseLineModel):
         
         super().__init__(databuilder, name)
 
-        self.seasonal_averages = self._get_temporal_averages(databuilder.dataloader_main)
+        self._temporal_idx_column = 'tidx'
 
     def forecast(self, dataset: DataSetSplit = 'test') -> None:
-        """
-        Forecast for set dataset
-        """
+        assert isinstance(self.databuilder, BaseLineDataBuilder)
+        id_col, t_col, idx_col = (self.epiconfig.id_column,
+                                self.epiconfig.temporal_column,
+                                self._temporal_idx_column)
+
+        df = (self.databuilder.dataloader_main
+                .sort_values([id_col, t_col]).copy())
+        df[idx_col] = self._get_seasonal_index(df)
+
+        # node-specific seasonal mean, fit on train only
+        seasonal_mean = (df[df['train']]
+                        .groupby([id_col, idx_col])['target'].mean()
+                        .rename('pred').reset_index())
+
+        # point prediction for ALL rows (train, val, test)
+        df = df.merge(seasonal_mean, on=[id_col, idx_col])
+
+        if self.epiconfig._prediction_mode == 'interval':
+            assert self.epiconfig.quantiles is not None
+            table = self._compute_residual_quantiles(['train', 'val'], df)
+            for i, q in enumerate(self.epiconfig.quantiles):
+                offset = df[idx_col].map(table[q])
+                df[f'pred_q{i+1}'] = (df['pred'] + offset).clip(lower=0)
+
+        df = df[df[dataset]]
+        out = df[[id_col, t_col, 'target'] + self.prediction_columns]
+
         for hh in range(self.databuilder.dataorchestrator.config.horizon_size):
+            self.predictions.add_horizon_predictions(dataset, self._transform(out), hh)
 
-            dl              = self.databuilder.dataloader_main
+        self._update_status('forecasted')
 
-            if not isinstance(dl, pd.DataFrame):
-                raise ValueError()
+    def _compute_residual_quantiles(self,
+                                    dataset: DataSetSplit | list[DataSetSplit],
+                                    df: pd.DataFrame) -> pd.DataFrame:
+        quantiles  = np.array(self.epiconfig.quantiles)
+        split_cols = [dataset] if isinstance(dataset, str) else dataset
 
-            # filter on dataset
-            evaluation_df = dl[dl[dataset]]
-            evaluation_df = evaluation_df[[self.epiconfig.id_column, self.epiconfig.temporal_column, 'target']]
+        d = df[df[split_cols].any(axis=1)].dropna(subset=['pred', 'target'])
+        resid = d['target'] - d['pred']
+        return resid.groupby(d[self._temporal_idx_column]).quantile(quantiles).unstack()
 
-            # get seasonal averages: average per week idx 
-            evaluation_df = self._get_seasonal_indexes(evaluation_df)
-            evaluation_df = pd.merge(evaluation_df, self.seasonal_averages, on=[self.epiconfig.id_column, 't_idx'])
-
-            evaluation_df = evaluation_df.rename(columns={'seasonal_mean': 'pred'}).drop(columns=['t_idx'])
-
-            evaluation_dataset = evaluation_df[[self.epiconfig.id_column, self.epiconfig.temporal_column, 'target'] + [self.pred_col]]
-            self.predictions.add_horizon_predictions(dataset, self._transform(evaluation_dataset), hh)            
-           
-        self._update_status('forecasted')   
-    
-    def _get_seasonal_indexes(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Adds t_idx column based on temporal frequency"""
-        
-        dfc         = df.copy()
-        freq        = self.databuilder.dataorchestrator.config.temporal_frequency
-
-        timestamp: pd.Series[pd.Timestamp]  = dfc[self.epiconfig.temporal_column]   
-
-        # add time-index column 't_idx
+    def _get_seasonal_index(self, df: pd.DataFrame) -> pd.Series:
+        """Returns seasonal index series based on temporal frequency"""
+        freq = self.databuilder.dataorchestrator.config.temporal_frequency
         if freq == 'w':
-            dfc['t_idx'] = timestamp.dt.isocalendar().week.astype(int)
+            return df[self.epiconfig.temporal_column].dt.isocalendar().week.astype(int)
+        elif freq == 'd':
+            return df[self.epiconfig.temporal_column].dt.dayofyear.astype(int)
         elif freq == 'm':
-            dfc['t_idx'] = timestamp.dt.month
+            return df[self.epiconfig.temporal_column].dt.month
         else:
             raise ValueError(f'Invalid temporal frequency found for ClimaScale model: {freq}')
         
-        return dfc
-    
-    def _get_temporal_averages(self, dataloader_main: pd.DataFrame) -> pd.DataFrame:
-        """Returns a df with the average target per (node, seasonal timepoint) over training data"""
-        dataloader_train = dataloader_main[dataloader_main['train']]
-        seasonal_index   = self._get_seasonal_indexes(dataloader_train)       
-
-        return (seasonal_index.groupby([self.epiconfig.id_column, 't_idx'])['target']
-                    .mean()
-                    .reset_index()
-                    .rename(columns={'target': 'seasonal_mean'}))
