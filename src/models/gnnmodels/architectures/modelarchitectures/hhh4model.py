@@ -57,7 +57,12 @@ class HHH4Model(GNNModel):
                           alpha_mode:         Literal['global', 'node'] = 'global',
                           incidence_features: list[str] | None = None,
                           endemic_features:   list[str] | None = None,
-                          init_from_train:    bool  = True):
+                          init_from_train:    bool  = True,
+                          endemic_mode:       Literal['loglinear', 'mlp'] = 'loglinear',
+                          node_effects:       bool  = True,
+                          node_penalty:       float = 0.01,
+                          neighbourhood_mode: Literal['rate', 'linear', 'gcn'] = 'rate',
+                          epidemic_mode:      Literal['rate', 'neural'] = 'rate'):
         """
         Parameters
         ----------
@@ -71,8 +76,29 @@ class HHH4Model(GNNModel):
             Feature columns read by the endemic branch. Default: every other
             feature (seasonal sin/cos encodings, population size/density).
         init_from_train : bool
-            Initialise the output biases at the mean train target, so training
-            starts at the right count scale.
+            Scale the network by the mean train target and initialise each node's
+            endemic level at its own train mean, so training starts at the right
+            count scale.
+        endemic_mode : {'loglinear', 'mlp'}
+            ``'loglinear'``: hhh4-style node-specific seasonality (intercept, and
+            per-node coefficients on the seasonal features). ``'mlp'``: the earlier
+            shared MLP, kept for comparison.
+        node_effects : bool
+            Node multipliers on the epidemic and neighbourhood branches.
+        node_penalty : float
+            Ridge penalty pulling node-specific parameters towards the shared ones.
+            Larger = more pooling; 0 = independent per node.
+        neighbourhood_mode : {'rate', 'linear', 'gcn'}
+            ``'rate'`` (default, as in hhh4): a rate times the lag-weighted,
+            edge-weighted mean of the neighbours' counts. ``'linear'`` / ``'gcn'``:
+            neural forms; more flexible but can collapse to a zero share.
+        epidemic_mode : {'rate', 'neural'}
+            ``'rate'`` (default): a rate times the lag-weighted own counts.
+            ``'neural'``: softplus of a linear map (the first version).
+
+        The rate forms need non-negative, untransformed lag features: use
+        ``target_column='cases', lag_column='cases'`` (case lags follow the raw
+        target) or keep the incidence lags out of the log / normalisation.
         """
         self._set_output_head('nb')
         self._check_target_untransformed()
@@ -91,12 +117,14 @@ class HHH4Model(GNNModel):
 
         # indices follow ColumnRegistry insertion order = feature-axis order of x
         incidence_idx = [feature_names.index(f) for f in incidence_features]
+        if 'rate' in (epidemic_mode, neighbourhood_mode):
+            self._check_features_untransformed(incidence_features)
         endemic_idx   = [feature_names.index(f) for f in endemic_features]
 
         self.incidence_features = list(incidence_features)
         self.endemic_features   = list(endemic_features)
 
-        mu_init = self._mean_train_target() if init_from_train else None
+        mu_init, node_means = self._train_target_means() if init_from_train else (None, None)
 
         self.model = HHH4Module(
             num_nodes     = len(self.databuilder.dataorchestrator.data_context.local_shapedata),
@@ -110,6 +138,12 @@ class HHH4Model(GNNModel):
             norm_edges    = norm_edges,
             alpha_mode    = alpha_mode,
             mu_init       = mu_init,
+            node_means    = node_means,
+            endemic_mode  = endemic_mode,
+            node_effects  = node_effects,
+            node_penalty  = node_penalty,
+            neighbourhood_mode = neighbourhood_mode,
+            epidemic_mode = epidemic_mode,
         ).to(self.device)
 
         self.config_info['model_hparams'] = {
@@ -121,6 +155,11 @@ class HHH4Model(GNNModel):
             'incidence_features': self.incidence_features,
             'endemic_features':   self.endemic_features,
             'init_from_train':    init_from_train,
+            'endemic_mode':       endemic_mode,
+            'node_effects':       node_effects,
+            'node_penalty':       node_penalty,
+            'neighbourhood_mode': neighbourhood_mode,
+            'epidemic_mode':      epidemic_mode,
         }
 
         self._update_status('model_hparams_set')
@@ -208,6 +247,26 @@ class HHH4Model(GNNModel):
         return ({k: np.stack(v) for k, v in comps.items()},
                 np.stack(mus), np.stack(alphas), np.stack(ys))
 
+    def _check_features_untransformed(self, features: list[str]) -> None:
+        reg = self.column_registration
+        bad = []
+        for f in features:
+            entry = reg.get_entry_by_name(f)
+            if not entry.transformation:
+                continue
+            group = entry.transformation_group
+            params = entry.transformation_params if group == 'self' else (
+                reg.get_entry_by_name(group).transformation_params if group else None)
+            if params is not None and any(getattr(params, a, None) is not None
+                                          for a in ('log', 'zscore', 'minmax')):
+                bad.append(f)
+        if bad:
+            raise ValueError(
+                f'The rate form needs raw, non-negative lag features, but {bad} are '
+                "transformed. Use target_column='cases' with lag_column='cases' (case "
+                "lags stay raw), or epidemic_mode='neural' / neighbourhood_mode='gcn'."
+            )
+
     def _check_target_untransformed(self) -> None:
         entry  = self.column_registration.get_entry_by_name('target')
         params = entry.transformation_params
@@ -227,9 +286,81 @@ class HHH4Model(GNNModel):
                 stacklevel=2,
             )
 
-    def _mean_train_target(self) -> float:
-        total, count = 0.0, 0
+    def _train_target_means(self) -> tuple[float, np.ndarray]:
+        """Mean train target overall and per node."""
+        total, count = None, 0
         for snapshot in self.databuilder.dataloader_train:
-            total += float(snapshot.y.sum())
-            count += snapshot.y.numel()
-        return total / max(count, 1)
+            y = snapshot.y.detach().cpu().double()
+            total = y.sum(dim=1) if total is None else total + y.sum(dim=1)
+            count += y.shape[1]
+        if total is None:
+            raise ValueError('Empty training dataloader.')
+        node_means = (total / count).numpy()
+        return float(node_means.mean()), node_means
+
+    # ======================================================================= #
+    # parameters
+    # ======================================================================= #
+    def node_parameters(self) -> pd.DataFrame:
+        """
+        Learned per-node parameters, one row per (node, horizon).
+
+        Columns
+        -------
+        node, node_name, horizon,
+        endemic_baseline   : endemic level with all endemic features at 0
+        seasonal_amplitude : peak-to-trough ratio of the endemic seasonal curve
+                             (exp(2A) for log-rate A*cos(...)); 1 = no seasonality
+        endemic_peak_week  : week of year (target time) at which the endemic
+                             curve peaks
+        epidemic_rate      : expected cases per (lag-weighted) own case (rate form)
+        neighbourhood_rate : expected cases per neighbour-mean case (rate form)
+        epidemic_multiplier, neighbourhood_multiplier : node effects, geometric mean 1
+        alpha              : NB dispersion
+
+        Seasonal columns need the log-linear endemic and the week-of-year
+        features (``time_index_w=True``).
+        """
+        p  = self.model.node_parameters()
+        N  = self.model.num_nodes
+        H  = self.epiconfig.horizon_size
+        id_col = self.epiconfig.id_column
+
+        rows = []
+        sin_i = cos_i = None
+        if 'endemic_coef' in p:
+            names = self.endemic_features
+            sin_i = next((i for i, f in enumerate(names) if f.endswith('sin_w')), None)
+            cos_i = next((i for i, f in enumerate(names) if f.endswith('cos_w')), None)
+
+        for hh in range(H):
+            df = pd.DataFrame({id_col: np.arange(N), 'horizon': hh})
+            if 'endemic_baseline' in p:
+                df['endemic_baseline'] = p['endemic_baseline'][:, hh]
+            if sin_i is not None and cos_i is not None:
+                b = p['endemic_coef'][:, sin_i, hh]
+                c = p['endemic_coef'][:, cos_i, hh]
+                amp   = np.sqrt(b ** 2 + c ** 2)
+                phase = np.arctan2(b, c)                       # peak of b*sin + c*cos
+                # week feature: theta = 2*pi*week/52, so the curve peaks at
+                # week = phase * 52 / (2*pi) (feature time t0); shift to target time
+                peak_t0 = phase / (2 * np.pi) * 52
+                lead  = self.epiconfig.horizon_leadtime + hh
+                df['seasonal_amplitude'] = np.exp(2 * amp)
+                df['endemic_peak_week']  = ((peak_t0 + lead - 1) % 52) + 1     # in [1, 53)
+            if 'epidemic_rate' in p:
+                df['epidemic_rate'] = p['epidemic_rate'][:, hh]
+            if 'neighbourhood_rate' in p:
+                df['neighbourhood_rate'] = p['neighbourhood_rate'][:, hh]
+            df['epidemic_multiplier']      = p['epidemic_multiplier']
+            df['neighbourhood_multiplier'] = p['neighbourhood_multiplier']
+            df['alpha'] = p['alpha']
+            rows.append(df)
+
+        out = pd.concat(rows, ignore_index=True)
+        names = self.context_data.nodenames
+        name_col = f'{self.epiconfig.level}_name'
+        if id_col in names.columns and name_col in names.columns:
+            out = out.merge(names[[id_col, name_col]].rename(columns={name_col: 'node_name'}),
+                            on=id_col, how='left')
+        return out

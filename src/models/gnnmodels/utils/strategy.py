@@ -53,6 +53,11 @@ class Strategy:
 
         loss    = loss_fn(y_hat, snapshot.y)
 
+        # optional model penalty (e.g. HHH4Module's ridge on node effects);
+        # only added during training, so val/test losses stay comparable
+        if hasattr(model, 'regularization'):
+            loss = loss + model.regularization()
+
         loss.backward()
         optimizer.step()
 

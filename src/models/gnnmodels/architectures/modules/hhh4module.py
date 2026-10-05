@@ -1,12 +1,24 @@
 from __future__ import annotations
 
 import math
+from typing import Literal
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv
-from torch_geometric.utils import remove_self_loops
+from torch_geometric.utils import remove_self_loops, scatter
+
+EndemicMode       = Literal['loglinear', 'mlp']
+EpidemicMode      = Literal['rate', 'neural']
+NeighbourhoodMode = Literal['rate', 'linear', 'gcn']
+
+
+def _inv_softplus(y: float) -> float:
+    """x such that softplus(x) = y (y > 0)."""
+    y = max(float(y), 1e-6)
+    return y + math.log(-math.expm1(-y))
 
 
 class HHH4Module(nn.Module):
@@ -19,56 +31,67 @@ class HHH4Module(nn.Module):
         mu_it = endemic_it + epidemic_it + neighbourhood_it
         Y_it  ~ NB(mu_it, alpha),    Var = mu + alpha * mu^2   (NB2)
 
-    =============  ===========================================  =======================
-    Branch         Reads                                        Mechanism
-    =============  ===========================================  =======================
-    endemic        seasonal / covariate features over window    MLP -> horizon
-    epidemic       the node's own incidence history             linear -> horizon
-    neighbourhood  neighbours' incidence history                GCN (no self-loops)
-    =============  ===========================================  =======================
+    Default ("rate") form, as in hhh4::
 
-    Each branch ends in a softplus, so every contribution is >= 0 and the shares
-    ``component / mu`` are interpretable.
+        endemic_ih       = exp(a_i + b_h + sum_f (w_fh + d_ifh) x_f(t0))
+        epidemic_ih      = exp(l_h + e_i) * sum_k pi_hk  y_i(t0 - k)
+        neighbourhood_ih = exp(p_h + n_i) * sum_k rho_hk ybar_i(t0 - k)
 
-    Only the total count is observed, so only the dispersion of the total is
-    identifiable: there is ONE NB likelihood on ``mu``, not one per branch. Use
-    ``sample_components`` for branch-level predictive draws that add up to the
-    total.
+    - ``a_i``: node intercept (initialised at the node's train mean), ``w``: shared
+      seasonal / covariate coefficients, ``d_i``: node deviations. With week-of-year
+      sin/cos features every region gets its own seasonal amplitude and peak week.
+    - ``exp(l_h)`` / ``exp(p_h)``: epidemic and neighbourhood rates, ``e_i`` / ``n_i``:
+      node effects on those rates.
+    - ``pi``, ``rho``: lag weights over the input window (softmax, sum to 1).
+    - ``ybar_i``: edge-weighted mean of the neighbours' counts (self-loops removed).
+
+    Node deviations are centred over nodes and ridge-penalised (``regularization``),
+    which pools regions with little data towards the shared values, like hhh4's
+    random effects.
+
+    Why rates: the neural alternative (softplus of a linear map, or GCN layers;
+    ``epidemic_mode='neural'``, ``neighbourhood_mode='linear'|'gcn'``) can let one
+    branch collapse to a zero share early in training. On simulated data with real
+    spread between regions the neural forms ended near zero neighbourhood share
+    with a worse fit; the rate form is linear in the counts, as the data-generating
+    process is, and has interpretable parameters.
+
+    Inputs of the epidemic / neighbourhood branches must be NON-NEGATIVE counts or
+    rates (raw scale) in the rate form; they are divided by ``scale`` (train mean of
+    the target) internally and clamped at 0.
 
     Parameters
     ----------
     num_nodes, seq_length, horizon_size : int
         Data dimensions.
     incidence_idx : list[int]
-        Feature-axis indices of the incidence (lag) columns. With ``lag_num > 1``
-        there are several. Order follows ``ColumnRegistry`` insertion order.
+        Feature-axis indices of the case / incidence lag columns.
     endemic_idx : list[int]
-        Feature-axis indices of the seasonal / covariate columns. May be empty, in
-        which case the endemic branch is a learned per-horizon constant.
-    hidden_size : int
-        Width of the endemic MLP and of the neighbourhood embedding.
-    num_layers : int
-        Number of GCN layers in the neighbourhood branch. Keep this at 1 for a
-        strict neighbourhood component: with 2+ layers a node's own signal can
-        come back through 2-hop paths (i -> j -> i), even without self-loops.
-    dropout_p : float
-        Dropout in the endemic MLP and neighbourhood branch.
-    norm_edges : bool
-        Symmetric GCN normalisation of the edge weights.
+        Feature-axis indices of the seasonal / covariate columns. May be empty.
+    hidden_size, num_layers, dropout_p, norm_edges
+        Only used by the neural forms (``'mlp'`` endemic, ``'neural'`` epidemic,
+        ``'gcn'`` neighbourhood).
     alpha_mode : {'global', 'node'}
         One dispersion for all nodes, or one per node.
     mu_init : float | None
-        Expected mean count per node and step (e.g. the train mean). Used to set
-        the output biases so that each branch starts at ``mu_init / 3``, instead
-        of at softplus(0) = 0.69, which is far off for counts in the hundreds.
+        Train mean of the target; sets ``scale``.
+    node_means : array-like [num_nodes] | None
+        Train mean per node; initialises the endemic intercepts.
+    endemic_mode : {'loglinear', 'mlp'}
+    epidemic_mode : {'rate', 'neural'}
+    neighbourhood_mode : {'rate', 'linear', 'gcn'}
+    node_effects : bool
+        Node effects on the epidemic and neighbourhood rates.
+    node_penalty : float
+        Ridge penalty on the centred node deviations (mean of squares).
 
     Shapes
     ------
     x           : [num_nodes, num_features, seq_length]
     edge_index  : [2, num_edges]
     edge_weight : [num_edges] or None
-    returns     : (mu [N, H], alpha [N, H]), and with ``return_components=True``
-                  also a dict {'endemic', 'epidemic', 'neighbourhood'} of [N, H].
+    returns     : (mu [N, H], alpha [N, H]); with ``return_components=True`` also a
+                  dict {'endemic', 'epidemic', 'neighbourhood'} of [N, H].
     """
     component_names = ('endemic', 'epidemic', 'neighbourhood')
 
@@ -83,7 +106,13 @@ class HHH4Module(nn.Module):
                  dropout_p:     float = 0.1,
                  norm_edges:    bool  = True,
                  alpha_mode:    str   = 'global',
-                 mu_init:       float | None = None):
+                 mu_init:       float | None = None,
+                 node_means                  = None,
+                 endemic_mode:  EndemicMode  = 'loglinear',
+                 node_effects:  bool  = True,
+                 node_penalty:  float = 0.01,
+                 neighbourhood_mode: NeighbourhoodMode = 'rate',
+                 epidemic_mode: EpidemicMode = 'rate'):
         super().__init__()
 
         if len(incidence_idx) == 0:
@@ -91,70 +120,148 @@ class HHH4Module(nn.Module):
         if set(incidence_idx) & set(endemic_idx):
             raise ValueError('incidence_idx and endemic_idx must be disjoint, '
                              'otherwise the branches are not separable.')
-        if alpha_mode not in ('global', 'node'):
-            raise ValueError(f"alpha_mode must be 'global' or 'node', got {alpha_mode!r}")
+        for name, val, ok in [('alpha_mode', alpha_mode, ('global', 'node')),
+                              ('endemic_mode', endemic_mode, ('loglinear', 'mlp')),
+                              ('epidemic_mode', epidemic_mode, ('rate', 'neural')),
+                              ('neighbourhood_mode', neighbourhood_mode, ('rate', 'linear', 'gcn'))]:
+            if val not in ok:
+                raise ValueError(f'{name} must be one of {ok}, got {val!r}')
 
         self.num_nodes    = num_nodes
         self.seq_length   = seq_length
         self.horizon_size = horizon_size
         self.num_layers   = num_layers
         self.alpha_mode   = alpha_mode
+        self.endemic_mode = endemic_mode
+        self.epidemic_mode = epidemic_mode
+        self.neighbourhood_mode = neighbourhood_mode
+        self.node_effects = node_effects
+        self.node_penalty = node_penalty
 
+        scale = float(mu_init) if mu_init is not None and mu_init > 0 else 1.0
+        self.register_buffer('scale',         torch.tensor(scale))
         self.register_buffer('incidence_idx', torch.tensor(incidence_idx, dtype=torch.long))
         self.register_buffer('endemic_idx',   torch.tensor(endemic_idx,   dtype=torch.long))
 
         n_inc = len(incidence_idx) * seq_length
-        n_end = len(endemic_idx) * seq_length
+        n_end = len(endemic_idx)
+        third = 1.0 / 3.0                       # each branch starts at a third of the mean
 
-        # ---- endemic: covariates -> horizon ----
-        if n_end > 0:
-            self.endemic = nn.Sequential(
-                nn.Linear(n_end, hidden_size),
-                nn.ReLU(),
-                nn.Dropout(dropout_p),
-                nn.Linear(hidden_size, horizon_size),
-            )
+        # ---- endemic ----
+        if endemic_mode == 'loglinear':
+            if node_means is not None:
+                nm = np.clip(np.asarray(node_means, dtype=float), 1e-3 * scale, None)
+                a0 = torch.tensor(np.log(nm * third / scale), dtype=torch.float32)
+            else:
+                a0 = torch.full((num_nodes,), math.log(third))
+            self.end_node_intercept = nn.Parameter(a0)                                   # a_i
+            self.end_horizon_bias   = nn.Parameter(torch.zeros(horizon_size))            # b_h
+            self.end_coef           = nn.Parameter(torch.zeros(n_end, horizon_size))     # w_fh
+            self.end_node_coef      = nn.Parameter(torch.zeros(num_nodes, n_end, horizon_size))  # d_ifh
         else:
-            self.endemic = None
-            self.endemic_const = nn.Parameter(torch.zeros(horizon_size))
+            if n_end > 0:
+                self.endemic = nn.Sequential(
+                    nn.Linear(n_end * seq_length, hidden_size), nn.ReLU(),
+                    nn.Dropout(dropout_p), nn.Linear(hidden_size, horizon_size))
+                with torch.no_grad():
+                    self.endemic[-1].bias.fill_(_inv_softplus(third))
+            else:
+                self.endemic = None
+                self.endemic_const = nn.Parameter(torch.full((horizon_size,), _inv_softplus(third)))
 
-        # ---- epidemic: own history -> horizon (autoregressive) ----
-        self.epidemic = nn.Linear(n_inc, horizon_size)
+        # ---- epidemic ----
+        if epidemic_mode == 'rate':
+            self.epi_log_rate   = nn.Parameter(torch.full((horizon_size,), math.log(third)))   # l_h
+            self.epi_lag_logits = nn.Parameter(torch.zeros(horizon_size, n_inc))               # pi_h
+        else:
+            self.epidemic = nn.Linear(n_inc, horizon_size)
+            with torch.no_grad():
+                self.epidemic.bias.fill_(_inv_softplus(third))
 
-        # ---- neighbourhood: embed history, aggregate over neighbours only ----
-        self.ne_embed = nn.Linear(n_inc, hidden_size)
-        self.ne_convs = nn.ModuleList([
-            GCNConv(hidden_size, hidden_size, add_self_loops=False, normalize=norm_edges)
-            for _ in range(num_layers)
-        ])
-        self.ne_dropout = nn.Dropout(dropout_p)
-        self.ne_out     = nn.Linear(hidden_size, horizon_size)
+        # ---- neighbourhood ----
+        if neighbourhood_mode == 'rate':
+            self.ne_log_rate   = nn.Parameter(torch.full((horizon_size,), math.log(third)))    # p_h
+            self.ne_lag_logits = nn.Parameter(torch.zeros(horizon_size, n_inc))                # rho_h
+        elif neighbourhood_mode == 'linear':
+            self.ne_out = nn.Linear(n_inc, horizon_size)
+            with torch.no_grad():
+                self.ne_out.bias.fill_(_inv_softplus(third))
+        else:
+            self.ne_embed = nn.Linear(n_inc, hidden_size)
+            self.ne_convs = nn.ModuleList([
+                GCNConv(hidden_size, hidden_size, add_self_loops=False, normalize=norm_edges)
+                for _ in range(num_layers)
+            ])
+            self.ne_dropout = nn.Dropout(dropout_p)
+            self.ne_out     = nn.Linear(hidden_size, horizon_size)
+            with torch.no_grad():
+                self.ne_out.bias.fill_(_inv_softplus(third))
+
+        # ---- node effects on epidemic / neighbourhood ----
+        if node_effects:
+            self.epi_node_effect = nn.Parameter(torch.zeros(num_nodes))   # e_i
+            self.ne_node_effect  = nn.Parameter(torch.zeros(num_nodes))   # n_i
 
         # ---- dispersion ----
         n_alpha = num_nodes if alpha_mode == 'node' else 1
         self.log_alpha = nn.Parameter(torch.full((n_alpha,), math.log(0.1)))
 
-        if mu_init is not None:
-            self._init_output_bias(mu_init)
-
     # ------------------------------------------------------------------ #
-    def _init_output_bias(self, mu_init: float) -> None:
-        """Set output biases so that softplus(bias) = mu_init / 3 per branch."""
-        target = max(float(mu_init) / 3.0, 1e-3)
-        bias   = target + math.log(-math.expm1(-target))     # inverse softplus
+    @staticmethod
+    def _centered(p: torch.Tensor) -> torch.Tensor:
+        """
+        Node deviations centred over nodes (dim 0). Without this, a common shift of
+        all node effects would duplicate the shared parameters, and the 'node
+        effect' would silently become a global scale (e.g. every multiplier 0.1).
+        Centred, exp(effect) has geometric mean 1 across nodes: a node's value
+        relative to the typical node.
+        """
+        return p - p.mean(dim=0, keepdim=True)
 
-        with torch.no_grad():
-            if self.endemic is not None:
-                self.endemic[-1].bias.fill_(bias)
-            else:
-                self.endemic_const.fill_(bias)
-            self.epidemic.bias.fill_(bias)
-            self.ne_out.bias.fill_(bias)
+    @staticmethod
+    def _neighbour_mean(h: torch.Tensor, edge_index: torch.Tensor,
+                        edge_weight: torch.Tensor | None) -> torch.Tensor:
+        """
+        Edge-weighted mean of the source nodes' features per target node,
+        sum_j w_ji h_j / sum_j w_ji. Nodes without neighbours get 0.
+        """
+        n = h.shape[0]
+        if edge_index.numel() == 0:
+            return torch.zeros_like(h)
+        src, dst = edge_index[0], edge_index[1]
+        w = edge_weight if edge_weight is not None else torch.ones(src.shape[0], device=h.device)
+        w = w.to(h.dtype)
+        num = scatter(h[src] * w.unsqueeze(-1), dst, dim=0, dim_size=n, reduce='sum')
+        den = scatter(w, dst, dim=0, dim_size=n, reduce='sum').clamp(min=1e-12).unsqueeze(-1)
+        return num / den
 
     def _select(self, x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
         """Feature subset, flattened over the window: [N, len(idx) * seq_length]."""
         # layout is (num_nodes, num_features, seq_length): index the FEATURE axis
         return x.index_select(1, idx).reshape(x.shape[0], -1)
+
+    @staticmethod
+    def _lagged(h: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+        """Lag-weighted average per horizon: [N, K] x softmax([H, K]) -> [N, H]."""
+        return h @ torch.softmax(logits, dim=-1).t()
+
+    def _node_mult(self, p: torch.Tensor) -> torch.Tensor:
+        return torch.exp(self._centered(p)).view(-1, 1)
+
+    def _endemic(self, x: torch.Tensor) -> torch.Tensor:
+        """Endemic rate in units of ``scale``: [N, H]."""
+        n = x.shape[0]
+        if self.endemic_mode == 'loglinear':
+            log_rate = self.end_node_intercept.view(n, 1) + self.end_horizon_bias.view(1, -1)
+            if self.endemic_idx.numel() > 0:
+                z = x.index_select(1, self.endemic_idx)[:, :, -1]                    # [N, F] at t0
+                coef = self.end_coef.unsqueeze(0) + self._centered(self.end_node_coef)   # [N, F, H]
+                log_rate = log_rate + torch.einsum('nf,nfh->nh', z, coef)
+            return torch.exp(log_rate.clamp(max=20.0))
+
+        if self.endemic is not None:
+            return F.softplus(self.endemic(self._select(x, self.endemic_idx)))
+        return F.softplus(self.endemic_const).expand(n, -1)
 
     def forward(self,
                 x:                 torch.Tensor,
@@ -162,26 +269,38 @@ class HHH4Module(nn.Module):
                 edge_weight:       torch.Tensor | None = None,
                 return_components: bool = False):
 
-        x_inc = self._select(x, self.incidence_idx)
+        scale = self.scale
+        x_inc = self._select(x, self.incidence_idx) / scale
 
-        # endemic
-        if self.endemic is not None:
-            endemic = F.softplus(self.endemic(self._select(x, self.endemic_idx)))
+        endemic = self._endemic(x) * scale
+
+        # ---- epidemic (own region) ----
+        if self.epidemic_mode == 'rate':
+            own = self._lagged(x_inc.clamp(min=0), self.epi_lag_logits)
+            epidemic = torch.exp(self.epi_log_rate).view(1, -1) * own * scale
         else:
-            endemic = F.softplus(self.endemic_const).expand(x.shape[0], -1)
+            epidemic = F.softplus(self.epidemic(x_inc)) * scale
 
-        # epidemic (own region)
-        epidemic = F.softplus(self.epidemic(x_inc))
-
-        # neighbourhood: strip any self-loops already in the graph. GCNConv's
-        # add_self_loops=False only stops it from ADDING loops, it does not remove
-        # existing ones, which would leak the node's own incidence into this branch.
+        # ---- neighbourhood ----
+        # strip any self-loops already in the graph: GCNConv's add_self_loops=False only
+        # stops it from ADDING loops, and a weighted mean over a self-loop would also leak
+        # the node's own incidence into this branch.
         ei, ew = remove_self_loops(edge_index, edge_weight)
-        h = F.relu(self.ne_embed(x_inc))
-        for conv in self.ne_convs:
-            h = F.relu(conv(h, ei, ew))
-            h = self.ne_dropout(h)
-        neighbourhood = F.softplus(self.ne_out(h))
+        if self.neighbourhood_mode == 'rate':
+            nb = self._lagged(self._neighbour_mean(x_inc.clamp(min=0), ei, ew), self.ne_lag_logits)
+            neighbourhood = torch.exp(self.ne_log_rate).view(1, -1) * nb * scale
+        elif self.neighbourhood_mode == 'linear':
+            neighbourhood = F.softplus(self.ne_out(self._neighbour_mean(x_inc, ei, ew))) * scale
+        else:
+            h = F.relu(self.ne_embed(x_inc))
+            for conv in self.ne_convs:
+                h = F.relu(conv(h, ei, ew))
+                h = self.ne_dropout(h)
+            neighbourhood = F.softplus(self.ne_out(h)) * scale
+
+        if self.node_effects:
+            epidemic      = epidemic      * self._node_mult(self.epi_node_effect)
+            neighbourhood = neighbourhood * self._node_mult(self.ne_node_effect)
 
         mu = endemic + epidemic + neighbourhood
 
@@ -192,6 +311,60 @@ class HHH4Module(nn.Module):
             components = {'endemic': endemic, 'epidemic': epidemic, 'neighbourhood': neighbourhood}
             return (mu, alpha), components
         return mu, alpha
+
+    # ------------------------------------------------------------------ #
+    def regularization(self) -> torch.Tensor:
+        """Ridge penalty pulling centred node deviations towards the shared parameters."""
+        terms = []
+        if self.endemic_mode == 'loglinear' and self.end_node_coef.numel() > 0:
+            terms.append(self._centered(self.end_node_coef).pow(2).mean())
+        if self.node_effects:
+            terms.append(self._centered(self.epi_node_effect).pow(2).mean())
+            terms.append(self._centered(self.ne_node_effect).pow(2).mean())
+        if not terms or self.node_penalty == 0:
+            return self.log_alpha.new_zeros(())
+        return self.node_penalty * torch.stack(terms).sum()
+
+    @torch.no_grad()
+    def node_parameters(self) -> dict[str, np.ndarray]:
+        """
+        Learned parameters as numpy arrays.
+
+        - ``endemic_baseline`` [N, H]: endemic level with all endemic features at 0,
+          in target units (counts or rates).
+        - ``endemic_coef`` [N, F, H]: total coefficient per endemic feature
+          (shared + centred node deviation), log scale. Log-linear mode only.
+        - ``epidemic_rate`` / ``neighbourhood_rate`` [N, H]: expected new cases per
+          (lag-weighted) case in the own region / per neighbour-mean case. Rate
+          form only; includes the node effects.
+        - ``epidemic_lag_weights`` / ``neighbourhood_lag_weights`` [H, K]: weights
+          over the input window columns (rate form only).
+        - ``epidemic_multiplier`` / ``neighbourhood_multiplier`` [N]: node effects,
+          centred so their geometric mean over nodes is 1.
+        - ``alpha`` [N]: NB dispersion per node (constant if global).
+        """
+        out: dict[str, np.ndarray] = {}
+        N = self.num_nodes
+        ones = torch.ones(N, device=self.log_alpha.device)
+        epi_mult = torch.exp(self._centered(self.epi_node_effect)) if self.node_effects else ones
+        ne_mult  = torch.exp(self._centered(self.ne_node_effect))  if self.node_effects else ones
+
+        if self.endemic_mode == 'loglinear':
+            base = torch.exp(self.end_node_intercept.view(N, 1) + self.end_horizon_bias.view(1, -1)) * self.scale
+            out['endemic_baseline'] = base.cpu().numpy()
+            out['endemic_coef']     = (self.end_coef.unsqueeze(0) + self._centered(self.end_node_coef)).cpu().numpy()
+
+        if self.epidemic_mode == 'rate':
+            out['epidemic_rate'] = (epi_mult.view(-1, 1) * torch.exp(self.epi_log_rate).view(1, -1)).cpu().numpy()
+            out['epidemic_lag_weights'] = torch.softmax(self.epi_lag_logits, -1).cpu().numpy()
+        if self.neighbourhood_mode == 'rate':
+            out['neighbourhood_rate'] = (ne_mult.view(-1, 1) * torch.exp(self.ne_log_rate).view(1, -1)).cpu().numpy()
+            out['neighbourhood_lag_weights'] = torch.softmax(self.ne_lag_logits, -1).cpu().numpy()
+
+        out['epidemic_multiplier']      = epi_mult.cpu().numpy()
+        out['neighbourhood_multiplier'] = ne_mult.cpu().numpy()
+        out['alpha'] = torch.exp(self.log_alpha).expand(N).cpu().numpy()
+        return out
 
 
 # ====================================================================== #
