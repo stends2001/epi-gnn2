@@ -112,6 +112,8 @@ class HHH4Module(nn.Module):
     dynamics_penalty : float
         Ridge penalty on the recurrent log-rate shifts (keeps them small unless
         the data need them).
+    disabled_branches : list of {'endemic', 'epidemic', 'neighbourhood'}
+        Branches fixed at 0, for ablations (e.g. a model without neighbourhood).
 
     Shapes
     ------
@@ -145,7 +147,8 @@ class HHH4Module(nn.Module):
                  rate_dynamics:  RateDynamics = 'gru',
                  dynamics_hidden: int = 16,
                  max_log_rate_adj: float = math.log(20.0),
-                 dynamics_penalty: float = 1e-3):
+                 dynamics_penalty: float = 1e-3,
+                 disabled_branches: list[str] | tuple = ()):
         super().__init__()
 
         if len(incidence_idx) == 0:
@@ -171,6 +174,10 @@ class HHH4Module(nn.Module):
         self.neighbourhood_mode = neighbourhood_mode
         self.node_effects = node_effects
         self.node_penalty = node_penalty
+        bad = set(disabled_branches) - set(self.component_names)
+        if bad or len(set(disabled_branches)) == 3:
+            raise ValueError(f'disabled_branches must be a strict subset of {self.component_names}, got {disabled_branches}')
+        self.disabled_branches = tuple(disabled_branches)
         has_rate = 'rate' in (epidemic_mode, neighbourhood_mode)
         self.seasonal_rates = bool(seasonal_rates) and has_rate and len(endemic_idx) > 0
         self.rate_dynamics  = rate_dynamics if has_rate else 'none'
@@ -386,7 +393,13 @@ class HHH4Module(nn.Module):
             epidemic      = epidemic      * self._node_mult(self.epi_node_effect)
             neighbourhood = neighbourhood * self._node_mult(self.ne_node_effect)
 
-        mu = endemic + epidemic + neighbourhood
+        if self.disabled_branches:
+            zero = lambda t: torch.zeros_like(t)
+            endemic       = zero(endemic) if 'endemic' in self.disabled_branches else endemic
+            epidemic      = zero(epidemic) if 'epidemic' in self.disabled_branches else epidemic
+            neighbourhood = zero(neighbourhood) if 'neighbourhood' in self.disabled_branches else neighbourhood
+
+        mu = (endemic + epidemic + neighbourhood).clamp(min=1e-6)
 
         alpha = torch.exp(self.log_alpha)
         alpha = alpha.view(-1, 1).expand_as(mu) if self.alpha_mode == 'node' else alpha.expand_as(mu)

@@ -323,14 +323,22 @@ def plot_calibration(models, dataset: str = 'test', season: str | None = 'in'):
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(12, 4.6))
     a1.plot([0, 1], [0, 1], color=INK_MUTED, lw=1, ls='--')
 
+    from ..utils.intervalmetrics import model_pit, pit_coverage
     for k, (label, m) in enumerate(items):
         col = SERIES_COLORS[k % len(SERIES_COLORS)]
         q = m.epiconfig.quantiles
         df = model_prediction_frame(m, dataset, 0, True, season)
-        s = summarize_intervals(df, q)
+        pit = model_pit(m, dataset, season)
+        if pit is not None and len(pit):
+            # count forecasts: randomised PIT (exactly uniform when calibrated)
+            s = pit_coverage(pit, q)
+            ranks = np.searchsorted(np.asarray(q), pit) / len(q)
+            label = f'{label} (randomised PIT)'
+        else:
+            s = summarize_intervals(df, q)
+            ranks = quantile_ranks(df, q)
         a1.plot(s['nominal'], s['coverage'], color=col, lw=2, marker='o', ms=8, label=label)
 
-        ranks = quantile_ranks(df, q)
         bins = np.linspace(0, 1, len(q) + 2)
         freq, _ = np.histogram(ranks, bins=bins)
         a2.step(np.arange(len(freq)), freq / freq.sum(), where='mid', color=col, lw=2, label=label)

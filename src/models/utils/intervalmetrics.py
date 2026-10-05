@@ -16,6 +16,11 @@ Metrics
 - Empirical coverage and mean width per central interval (nominal 1 - 2 q_k).
 - PIT-style quantile ranks: the fraction of quantile levels below the target.
   For a calibrated forecast, the ranks are roughly uniform.
+- Count forecasts: plain interval coverage is biased upwards when quantiles are
+  whole numbers (a 50% interval [1, 3] around a mean of 2 holds ~70%). For models
+  with an NB predictive distribution use the randomised PIT
+  (``nb_randomized_pit``, ``pit_coverage``), which is exactly uniform when the
+  forecast is calibrated.
 
 Report these per horizon and per node group, not only pooled: pooled coverage can
 look fine while large and small regions are mis-covered in opposite directions.
@@ -114,6 +119,71 @@ def coverage_and_width(df: pd.DataFrame, quantiles: list[float]) -> pd.DataFrame
             'width'   : float(np.mean(u - l)),
         })
     return pd.DataFrame(rows)
+
+
+def nb_randomized_pit(y, mu, alpha, seed: int = 0) -> np.ndarray:
+    """
+    Randomised PIT for NB2(mu, alpha) count forecasts (Czado, Gneiting & Held 2009).
+
+    For a count y the CDF jumps at y, so the PIT is drawn uniformly between
+    F(y - 1) and F(y). For a calibrated count forecast the result is exactly
+    uniform, which the plain interval coverage of a count forecast is not:
+    with whole-number quantiles a "50% interval" holds more than 50% of the
+    probability, most of all for small counts.
+    """
+    from scipy.stats import nbinom
+    y     = np.asarray(y, dtype=float)
+    mu    = np.clip(np.asarray(mu, dtype=float), 1e-10, None)
+    alpha = np.clip(np.asarray(alpha, dtype=float), 1e-10, None)
+    r     = 1.0 / alpha
+    p     = r / (r + mu)
+    yi    = np.round(y)
+    hi    = nbinom.cdf(yi, r, p)
+    lo    = np.where(yi > 0, nbinom.cdf(yi - 1, r, p), 0.0)
+    u     = np.random.default_rng(seed).uniform(size=y.shape)
+    return lo + u * (hi - lo)
+
+
+def pit_coverage(pit, quantiles: list[float]) -> pd.DataFrame:
+    """
+    Count-aware coverage from (randomised) PIT values: the share of PIT values
+    inside the central interval [q, 1 - q]. Expected value: 1 - 2q exactly, also
+    for small counts. Same layout as ``coverage_and_width`` (without widths).
+    """
+    _check_quantiles(quantiles)
+    pit = np.asarray(pit, dtype=float)
+    K = len(quantiles) // 2
+    rows = []
+    for k in range(K):
+        q = quantiles[k]
+        rows.append({'lower_q': q, 'upper_q': quantiles[-1 - k], 'nominal': 1.0 - 2.0 * q,
+                     'coverage': float(np.mean((pit >= q) & (pit <= 1 - q))),
+                     'below': float(np.mean(pit < q)), 'above': float(np.mean(pit > 1 - q))})
+    return pd.DataFrame(rows)
+
+
+def model_pit(model, dataset: str = 'test', season: str | None = None,
+              season_weeks: tuple[int, int] | None = None) -> np.ndarray | None:
+    """
+    Randomised PIT values of a model with a full predictive distribution: NB
+    (``HHH4Model``) or simulated (the R hhh4 wrapper, via ``pit_bounds``),
+    filtered by season on the target week.
+    None for models without a full predictive distribution (baselines, quantile heads).
+    """
+    if hasattr(model, 'predictive_nb'):
+        df = model.predictive_nb(dataset)                # columns: target_time, node, target, mu, alpha
+    elif hasattr(model, 'pit_bounds'):
+        df = model.pit_bounds(dataset)                   # columns: target_time, lo = F(y-1), hi = F(y)
+    else:
+        return None
+    if season is not None:
+        weeks = season_weeks or season_weeks_for(getattr(model.epiconfig, 'disease', None))
+        m = season_mask(df['target_time'], *weeks).to_numpy()
+        df = df[m if season == 'in' else ~m]
+    if 'mu' in df.columns:
+        return nb_randomized_pit(df['target'], df['mu'], df['alpha'])
+    u = np.random.default_rng(0).uniform(size=len(df))
+    return df['lo'].to_numpy() + u * (df['hi'].to_numpy() - df['lo'].to_numpy())
 
 
 def quantile_ranks(df: pd.DataFrame, quantiles: list[float]) -> pd.Series:
@@ -250,7 +320,10 @@ def compare_models(models,
                    reference: str | None = None,
                    season_weeks: tuple[int, int] | None = None) -> pd.DataFrame:
     """
-    One row per model and horizon: WIS (and parts), 50/80/95% coverage and width.
+    One row per model and horizon: WIS (and parts), 50/80/95% coverage and width,
+    and for models with an NB predictive distribution the count-aware coverage
+    from the randomised PIT (``pitcov50`` ...). For count forecasts read pitcov,
+    not cov: whole-number quantiles make plain interval coverage too high.
 
     ``models`` is a list or a dict {label: model}. With ``reference`` (a model
     name or label), adds ``rel_wis`` = WIS / WIS of the reference (< 1 is better).
@@ -267,6 +340,10 @@ def compare_models(models,
                 lvl = int(round(r['nominal'] * 100))
                 row[f'cov{lvl}']   = r['coverage']
                 row[f'width{lvl}'] = r['width']
+            pit = model_pit(m, dataset, season, season_weeks) if hh == 0 else None
+            if pit is not None and len(pit):
+                for _, r in pit_coverage(pit, m.epiconfig.quantiles).iterrows():
+                    row[f'pitcov{int(round(r["nominal"] * 100))}'] = r['coverage']
             rows.append(row)
     out = pd.DataFrame(rows)
     if reference is not None:

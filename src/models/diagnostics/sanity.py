@@ -147,14 +147,30 @@ def sanity_report(model,
 
     # ---- 3. calibration ----
     if len(df) > 0:
+        from ..utils.intervalmetrics import model_pit, pit_coverage
         summ = summarize_intervals(df, q)
-        for _, r in summ.iterrows():
-            gap = r['coverage'] - r['nominal']
-            add(f"coverage {int(round(r['nominal']*100))}% interval", round(r['coverage'], 3),
-                f"{r['nominal']:.2f} ± 0.05",
-                PASS if abs(gap) <= 0.05 else WARN if abs(gap) <= 0.15 else FAIL,
-                f"below {r['below']:.3f}, above {r['above']:.3f} "
-                "(should each be about (1 - nominal) / 2)")
+        pit  = model_pit(model, dataset, season, season_weeks)
+        if pit is not None and len(pit):
+            # count forecasts: judge calibration on the randomised PIT; plain interval
+            # coverage of whole-number quantiles is biased upwards and only reported
+            for _, r in pit_coverage(pit, q).iterrows():
+                gap = r['coverage'] - r['nominal']
+                add(f"coverage {int(round(r['nominal']*100))}% (randomised PIT)", round(r['coverage'], 3),
+                    f"{r['nominal']:.2f} ± 0.05",
+                    PASS if abs(gap) <= 0.05 else WARN if abs(gap) <= 0.15 else FAIL,
+                    f"below {r['below']:.3f}, above {r['above']:.3f} (each about (1 - nominal) / 2)")
+            for _, r in summ.iterrows():
+                add(f"coverage {int(round(r['nominal']*100))}% interval (whole-number quantiles)",
+                    round(r['coverage'], 3), 'above nominal for small counts', INFO,
+                    'count quantiles are whole numbers, so intervals hold more than nominal')
+        else:
+            for _, r in summ.iterrows():
+                gap = r['coverage'] - r['nominal']
+                add(f"coverage {int(round(r['nominal']*100))}% interval", round(r['coverage'], 3),
+                    f"{r['nominal']:.2f} ± 0.05",
+                    PASS if abs(gap) <= 0.05 else WARN if abs(gap) <= 0.15 else FAIL,
+                    f"below {r['below']:.3f}, above {r['above']:.3f} "
+                    "(should each be about (1 - nominal) / 2)")
 
         widths = df[pred_cols[-1]] - df[pred_cols[0]]
         zero_w = float((widths <= 1e-9).mean())
@@ -164,6 +180,8 @@ def sanity_report(model,
 
         ranks = quantile_ranks(df, q)
         extreme = float(((ranks == 0) | (ranks == 1)).mean())
+        if pit is not None and len(pit):
+            extreme = float(((pit < q[0]) | (pit > 1 - q[0])).mean())
         expected = 2 * q[0]
         add('truth outside all quantiles (PIT tails)', round(extreme, 3), f'about {expected:.3f}',
             PASS if extreme <= 2 * expected + 0.02 else WARN,

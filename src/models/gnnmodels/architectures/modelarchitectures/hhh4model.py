@@ -67,7 +67,8 @@ class HHH4Model(GNNModel):
                           rate_dynamics:      Literal['none', 'gru', 'lstm'] = 'gru',
                           dynamics_hidden:    int   = 16,
                           max_log_rate_adj:   float = 3.0,
-                          dynamics_penalty:   float = 1e-3):
+                          dynamics_penalty:   float = 1e-3,
+                          disabled_branches:  list[str] | None = None):
         """
         Parameters
         ----------
@@ -108,6 +109,8 @@ class HHH4Model(GNNModel):
             and their weekly change) and shifts both rates per region and week, so
             the model can follow fast growth and decline (influenza). ``'none'``
             gives constant rates (plus the seasonal terms).
+        disabled_branches : list[str] | None
+            Branches fixed at 0, for ablations.
         dynamics_hidden, max_log_rate_adj, dynamics_penalty
             Hidden size of the recurrent unit; bound on its log-rate shift
             (3.0 = rates scaled by up to e^3 = 20x either way); ridge penalty on it.
@@ -165,6 +168,7 @@ class HHH4Model(GNNModel):
             dynamics_hidden = dynamics_hidden,
             max_log_rate_adj = max_log_rate_adj,
             dynamics_penalty = dynamics_penalty,
+            disabled_branches = tuple(disabled_branches or ()),
         ).to(self.device)
         self.alpha_scale = 1.0
 
@@ -187,6 +191,7 @@ class HHH4Model(GNNModel):
             'dynamics_hidden':    dynamics_hidden,
             'max_log_rate_adj':   max_log_rate_adj,
             'dynamics_penalty':   dynamics_penalty,
+            'disabled_branches':  list(disabled_branches or []),
         }
 
         self._update_status('model_hparams_set')
@@ -231,6 +236,21 @@ class HHH4Model(GNNModel):
             frames.append(df)
 
         return pd.concat(frames, ignore_index=True)
+
+    def predictive_nb(self, dataset: DataSetSplit = 'test', horizon: int = 0) -> pd.DataFrame:
+        """
+        NB predictive distribution per row: target_time, node, target, mu, alpha
+        (dispersion including the calibration scale). Used for the randomised PIT.
+        """
+        comp = self.forecast_components(dataset)
+        comp = comp[comp['horizon'] == horizon]
+        steps = self.epiconfig.horizon_leadtime + horizon
+        out = pd.DataFrame({
+            'target_time': pd.to_datetime(comp[self.epiconfig.temporal_column]) + pd.Timedelta(weeks=steps),
+            self.epiconfig.id_column: comp[self.epiconfig.id_column].to_numpy(),
+            'target': comp['target'].to_numpy(), 'mu': comp['mu'].to_numpy(), 'alpha': comp['alpha'].to_numpy(),
+        })
+        return out.reset_index(drop=True)
 
     def sample_component_draws(self,
                                dataset:   DataSetSplit = 'test',
