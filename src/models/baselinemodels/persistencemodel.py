@@ -1,127 +1,91 @@
-import pandas as pd 
-import numpy as np
+from typing import Literal
 
-from ...dataloading.databuilders import BaseLineDataBuilder 
-from .baselinemodel import BaseLineModel 
+import pandas as pd
+
+from ...dataloading.databuilders import BaseLineDataBuilder
+from .baselinemodel import BaseLineModel
+from ..utils.conformal import ResidualScale, residual_quantile_table
 
 from ...utils import DataSetSplit
 
 class Persistence(BaseLineModel):
-    """ 
+    """
     Persistence model returns the most recent observation as prediction.
+
+    In interval mode, quantiles come from residuals of the same persistence
+    forecast on the calibration pool (default train + val), grouped per
+    (horizon, seasonal index). Persistence has no fitted parameters, so its
+    train residuals are honest out-of-sample errors.
 
     See Also
     --------
     ``BaseModel``
         Parent class of all models.
     ``BaseLineModel``
-        Parent class of baseline models.
+        Parent class of baseline models, documents the calibration options.
     """
-    def __init__(self, 
-                 databuilder : BaseLineDataBuilder,                 
-                 name: str = 'persistence_model'):
-        
-        super().__init__(databuilder, name)
+    def __init__(self,
+                 databuilder : BaseLineDataBuilder,
+                 name: str = 'persistence_model',
+                 residual_scale: ResidualScale = 'additive',
+                 min_bin_obs: int = 30,
+                 calibration_splits: list[Literal['train', 'val']] | None = None):
 
-    def _get_seasonal_index(self, df: pd.DataFrame) -> pd.Series:
-        """Returns seasonal index series based on temporal frequency"""
-        freq = self.databuilder.dataorchestrator.config.temporal_frequency
-        if freq == 'w':
-            return df[self.epiconfig.temporal_column].dt.isocalendar().week.astype(int)
-        elif freq == 'd':
-            return df[self.epiconfig.temporal_column].dt.dayofyear.astype(int)
-        elif freq == 'm':
-            return df[self.epiconfig.temporal_column].dt.month
-        else:
-            raise ValueError(f'Invalid temporal frequency found for ClimaScale model: {freq}')
-    
-    def _compute_residual_quantiles(self, dataset: DataSetSplit | list[DataSetSplit]) -> dict[int, pd.DataFrame]:
-        """
-        Per-horizon residual quantiles based on column 'pred', keyed by horizon.
-        Each value is a DataFrame indexed by seasonal index, columned by quantile.
+        super().__init__(databuilder, name,
+                         residual_scale     = residual_scale,
+                         min_bin_obs        = min_bin_obs,
+                         calibration_splits = calibration_splits)
 
-        ``dataset`` may be a single split or a list of splits (e.g.
-        ``['train', 'val']``) to pool residuals across more than one —
-        legitimate for Persistence specifically, since it has no fitted
-        parameters and therefore no optimism-bias risk from including
-        train in its own calibration pool.
-        """
-        quantiles        = self.databuilder.dataorchestrator.config.quantiles
-        horizon_leadtime = self.databuilder.dataorchestrator.config.horizon_leadtime
-        horizon_size     = self.databuilder.dataorchestrator.config.horizon_size
+    def _persistence_frame(self, hh: int) -> pd.DataFrame:
+        """Main data with the persistence point forecast for horizon ``hh`` in 'pred'."""
+        timeshift_num = int(hh + self.databuilder.dataorchestrator.config.horizon_leadtime)
 
-        split_cols = [dataset] if isinstance(dataset, str) else dataset
+        df = self.databuilder.dataloader_main
+        df = df.sort_values([self.epiconfig.id_column, self.epiconfig.temporal_column]).copy()
 
-        tables: dict[int, pd.DataFrame] = {}
-
-        for hh in range(horizon_size):
-            timeshift_num = int(hh + horizon_leadtime)
-
-            df = self.databuilder.dataloader_main
-            df = df.sort_values([self.epiconfig.id_column, self.epiconfig.temporal_column]).copy()
-
-            df['pred'] = df.groupby(self.epiconfig.id_column)['target'].shift(timeshift_num)
-
-            # filter to the pooled split(s) AFTER shifting
-            df = df[df[split_cols].any(axis=1)].dropna(subset=['pred', 'target'])
-
-            residuals = df['target'] - df['pred']
-            t_idx     = self._get_seasonal_index(df)
-
-            tables[hh] = (
-                residuals.groupby(t_idx)
-                          .quantile(np.array(quantiles))
-                          .unstack()
-            )
-
-        return tables
+        # the prediction is the target, shifted by ``timeshift_num`` within each node
+        df['pred'] = df.groupby(self.epiconfig.id_column)['target'].shift(timeshift_num)
+        return df
 
     def forecast(self, dataset: DataSetSplit = 'test') -> None:
         """
         Forecast for set dataset
         """
         assert isinstance(self.databuilder, BaseLineDataBuilder)
-
-        if self.epiconfig._prediction_mode == 'interval':
-            self._residual_quantiles = self._compute_residual_quantiles(['train','val'])
+        interval_mode = self.epiconfig._prediction_mode == 'interval'
 
         for hh in range(self.databuilder.dataorchestrator.config.horizon_size):
 
-            # get shift between target and pred
-            timeshift_num = int(hh + self.databuilder.dataorchestrator.config.horizon_leadtime)
-            evaluation_df = self.databuilder.dataloader_main
+            evaluation_df = self._persistence_frame(hh)
 
-            evaluation_df = evaluation_df.sort_values([
-                self.epiconfig.id_column, 
-                self.epiconfig.temporal_column]
-            ).copy()
-
-            # group by, and shift 'target' by ``timeshift_num``.
-            # that is the prediction: the shifted 'target'.
-            persistence_pred = evaluation_df.groupby(
-                self.epiconfig.id_column
-                )['target'].shift(timeshift_num)
-
-            # point-predictions:
-            evaluation_df['pred'] = persistence_pred
-
-            if self.epiconfig._prediction_mode == 'interval':
-                assert self.epiconfig.quantiles != None
-                assert self.epiconfig._num_quantiles != None
-
+            if interval_mode:
+                assert self.epiconfig.quantiles is not None
                 t_idx = self._get_seasonal_index(evaluation_df)
-                horizon_table = self._residual_quantiles[hh]   # this horizon's table
 
+                # calibration pool: filter AFTER shifting, so the first rows of a split
+                # still use the last observations of the previous split as forecast
+                pool = evaluation_df[self.calibration_splits].any(axis=1)
+
+                table = residual_quantile_table(
+                    target    = evaluation_df.loc[pool, 'target'],
+                    pred      = evaluation_df.loc[pool, 'pred'],
+                    group     = t_idx[pool],
+                    quantiles = self.epiconfig.quantiles,
+                    scale     = self.residual_scale,
+                    min_obs   = self.min_bin_obs,
+                )
+                self.calibration_tables[hh] = table
+
+                quantile_preds = table.apply(evaluation_df['pred'], t_idx, clip_lower=0.0)
                 for i, q in enumerate(self.epiconfig.quantiles):
-                    offset = t_idx.map(horizon_table[q])
-                    evaluation_df[f'pred_q{i+1}'] = (persistence_pred + offset).clip(lower=0)
+                    evaluation_df[f'pred_q{i+1}'] = quantile_preds[q]
 
-           # filter on dataset train/val/test
+            # filter on dataset train/val/test
             evaluation_df = evaluation_df[evaluation_df[dataset]]
             evaluation_dataset = evaluation_df[
                 [self.epiconfig.id_column, self.epiconfig.temporal_column, 'target'] + self.prediction_columns
-                ]                
-        
+                ]
+
             self.predictions.add_horizon_predictions(dataset, self._transform(evaluation_dataset), hh)
 
-        self._update_status('forecasted')   
+        self._update_status('forecasted')
