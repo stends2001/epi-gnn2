@@ -1,0 +1,5 @@
+# Norovirus, campylobacter and influenza side by side (one seed each)
+extends: base.yaml
+task: compare_diseases
+compare:
+  diseases: [norovirus, campylobacter, influenza]

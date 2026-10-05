@@ -1,0 +1,4 @@
+# HHH4 GNN vs baselines, influenza NUTS3, 3 seeds
+extends: hhh4_norovirus.yaml
+data:
+  disease: influenza

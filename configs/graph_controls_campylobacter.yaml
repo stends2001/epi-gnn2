@@ -1,0 +1,4 @@
+# Same graph controls for campylobacter: expect little difference real vs rewired
+extends: graph_controls_norovirus.yaml
+data:
+  disease: campylobacter

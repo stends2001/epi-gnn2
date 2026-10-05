@@ -1,0 +1,7 @@
+# HHH4 GNN vs baselines, norovirus NUTS3, 3 seeds, full diagnostics
+extends: base.yaml
+task: hhh4
+data:
+  disease: norovirus
+train:
+  seeds: [0, 1, 2]

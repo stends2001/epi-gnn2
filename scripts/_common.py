@@ -2,7 +2,7 @@
 Shared setup for the run scripts: paths, the config, data builders and a
 seeded HHH4 training helper.
 
-Edit the CONSTANTS block below once (graph file, dates); every script imports
+Shared settings (graph file, dates, quantiles) are read from configs/base.yaml; every script imports
 from here. Scripts can be run whole (``python scripts/02_hhh4.py``) or cell by cell
 (``# %%`` markers work in VS Code and PyCharm as notebook cells).
 """
@@ -27,20 +27,17 @@ from src.dataloading import EpiConfig, EpiDataOrchestrator, BaseLineDataBuilder,
 from src.graphconstruction import identity_graph, rewired_graph  # noqa: E402
 
 # =========================================================================== #
-# CONSTANTS - edit these
+# Shared settings come from configs/base.yaml (the same file run.py uses), so
+# the graph file and dates are set in one place.
 # =========================================================================== #
-# Graph file name (the same file you pass to retrieve_static_graph), e.g. the
-# contiguity graph from the first paper.
-GRAPH_FILE = 'YOUR_GRAPH_FILE'
+from src.experiments.config import load_config  # noqa: E402
 
-QUANTILES = [0.025, 0.1, 0.25, 0.5, 0.75, 0.9, 0.975]
+_BASE = load_config(ROOT / 'configs' / 'base.yaml', check=False)
 
-# Pre-COVID test season by default (2018/19). COVID-19 measures distorted
-# 2019/20 onwards for most notifiable diseases.
-DATES = dict(min_date='2012-06-01', split_trainval='2017-06-01',
-             split_valtest='2018-06-01', max_date='2019-06-01')
-
-RESULTS = ROOT / 'results'
+GRAPH_FILE = _BASE['data']['graph_file']
+QUANTILES  = list(_BASE['data']['quantiles'])
+DATES      = dict(_BASE['data']['dates'])        # default: pre-COVID test season 2018/19
+RESULTS    = ROOT / _BASE.get('output_dir', 'results')
 # =========================================================================== #
 
 
@@ -85,7 +82,7 @@ def graph_builder(edo, graph: str = 'real', seed: int = 0) -> GraphDataBuilder:
     """
     gdb = GraphDataBuilder(edo)
     if GRAPH_FILE == 'YOUR_GRAPH_FILE':
-        raise ValueError('Set GRAPH_FILE in scripts/_common.py to your graph file name.')
+        raise ValueError('Set data.graph_file in configs/base.yaml to your graph file name.')
     gdb.retrieve_static_graph(GRAPH_FILE)
     real = gdb.graph
 

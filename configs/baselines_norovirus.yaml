@@ -1,0 +1,5 @@
+# Baselines (Persistence, Seasonal Average), both residual scales, norovirus NUTS3
+extends: base.yaml
+task: baselines
+baselines:
+  residual_scales: [additive, log1p]

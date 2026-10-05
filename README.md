@@ -10,6 +10,37 @@ diagnostics and run scripts cover calibration, the component split and graph
 controls. Next: graph-control experiments per disease (norovirus,
 campylobacter, influenza).
 
+## Running experiments
+
+Set `data.graph_file` once in `configs/base.yaml`, then:
+
+```bash
+python run.py configs/smoke_test.yaml          # 3 epochs: does the pipeline run on your data?
+python run.py configs/hhh4_norovirus.yaml      # HHH4 vs baselines, 3 seeds, all diagnostics
+python run.py configs/hhh4_norovirus.yaml configs/hhh4_campylobacter.yaml   # several in a row
+python run.py --list                           # what is available
+```
+
+| Config | Task |
+|---|---|
+| `smoke_test.yaml` | quick end-to-end check, no figures |
+| `baselines_norovirus.yaml` | Persistence and Seasonal Average, additive and log1p residuals |
+| `hhh4_norovirus.yaml`, `hhh4_campylobacter.yaml`, `hhh4_influenza.yaml` | HHH4 vs baselines, 3 seeds |
+| `graph_controls_norovirus.yaml`, `graph_controls_campylobacter.yaml` | real vs identity vs 10 rewired graphs x 5 seeds, permutation p-value (slow) |
+| `compare_diseases.yaml` | norovirus, campylobacter and influenza side by side |
+
+Change anything without editing files, with dotted keys:
+
+```bash
+python run.py configs/hhh4_norovirus.yaml --set data.lead=2 data.level=nuts2 train.seeds=[0,1,2,3,4]
+python run.py configs/hhh4_norovirus.yaml --dry-run      # show the resolved config, run nothing
+```
+
+A new experiment is a small YAML file that `extends:` another one and lists only
+what differs. Each run writes `results/<name>/<timestamp>/` with `summary.txt`
+(headline numbers), `log.txt`, `config.yaml` (the resolved config; run it again
+to reproduce), CSV tables and `figures/`.
+
 ## Interval mode
 
 Set quantile levels in `EpiConfig`, as decimals:
@@ -159,10 +190,11 @@ gdb = GraphDataBuilder(edo).retrieve_static_graph(GRAPH_FILE)
 gdb.use_graph(rewired_graph(gdb.graph, seed=3)).build()   # same degrees, scrambled geography
 ```
 
-## Scripts
+## Interactive scripts
 
-Set `GRAPH_FILE` (and dates if needed) in `scripts/_common.py`, then run from the
-repo root, whole or cell by cell (`# %%`):
+The same steps as notebook-style scripts, for exploring step by step. They read
+the graph file and dates from `configs/base.yaml`. Run from the repo root, whole
+or cell by cell (`# %%`):
 
 | Script | What it does |
 |---|---|

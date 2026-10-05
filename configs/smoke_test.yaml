@@ -1,0 +1,10 @@
+# Quick end-to-end check (few epochs, no figures): does the pipeline run?
+extends: base.yaml
+task: hhh4
+name: smoke_test
+train:
+  n_epochs: 3
+  patience: 3
+  seeds: [0]
+evaluation:
+  figures: false

@@ -1,0 +1,10 @@
+# Real vs identity vs 10 rewired graphs x 5 seeds, norovirus (slow: 60 trainings)
+extends: base.yaml
+task: graph_controls
+data:
+  disease: norovirus
+train:
+  n_epochs: 200
+  seeds: [0, 1, 2, 3, 4]
+graph_controls:
+  n_rewired: 10

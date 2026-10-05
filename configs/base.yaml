@@ -1,0 +1,57 @@
+# Shared defaults; every other config extends this file.
+# Set data.graph_file once here.
+
+task: hhh4                 # baselines | hhh4 | graph_controls | compare_diseases
+name: null                 # output folder name; default: <task>_<disease>_<level>_lead<N>
+output_dir: results
+
+data:
+  disease: norovirus       # norovirus | campylobacter | influenza | chickenpox
+  level: nuts3             # nuts1 | nuts2 | nuts3
+  target: cases            # cases (NB on raw counts) | incidence (baselines only)
+  lead: 4                  # weeks ahead
+  sequence_length: 4       # input window (weeks)
+  lag_num: 1
+  graph_file: YOUR_GRAPH_FILE   # file name passed to retrieve_static_graph
+  quantiles: [0.025, 0.1, 0.25, 0.5, 0.75, 0.9, 0.975]
+  dates:                   # default test season 2018/19, before COVID-19 measures
+    min_date: '2012-06-01'
+    split_trainval: '2017-06-01'
+    split_valtest: '2018-06-01'
+    max_date: '2019-06-01'
+  feature_popsize: false
+  feature_popdens: false
+  normalization_method: zscore   # applies to non-count features; case counts stay raw
+  epiconfig: {}            # any other EpiConfig fields, passed through as-is
+
+baselines:
+  residual_scales: [log1p]       # [additive, log1p] fits both
+  min_bin_obs: 30
+  train_residuals: leave_one_year_out
+
+model:                     # HHH4Model.set_model_hparams
+  alpha_mode: node
+  endemic_mode: loglinear
+  epidemic_mode: rate
+  neighbourhood_mode: rate
+  node_effects: true
+  node_penalty: 0.01
+
+train:                     # HHH4Model.set_global_hparams, plus seeds
+  lr: 0.005
+  n_epochs: 300
+  patience: 30
+  seeds: [0]
+
+evaluation:
+  season: in               # in | off | null (all weeks)
+  reference: seasonal_average
+  figures: true
+  nodes_to_plot: [0, 1, 2]
+
+graph_controls:
+  n_rewired: 10
+  include_identity: true
+
+compare:
+  diseases: [norovirus, campylobacter, influenza]

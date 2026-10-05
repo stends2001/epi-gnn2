@@ -1,0 +1,4 @@
+# HHH4 GNN vs baselines, campylobacter NUTS3 (non-transmissible contrast), 3 seeds
+extends: hhh4_norovirus.yaml
+data:
+  disease: campylobacter
