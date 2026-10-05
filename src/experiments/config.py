@@ -17,14 +17,14 @@ from typing import Any
 
 import yaml
 
-TASKS = ('baselines', 'hhh4', 'graph_controls', 'compare_diseases')
+TASKS = ('baselines', 'hhh4', 'graph_controls', 'compare_diseases', 'ablations', 'recovery')
 
 # keys passed straight to HHH4Model.set_model_hparams / set_global_hparams
 MODEL_KEYS = {'hidden_size', 'num_layers', 'dropout', 'norm_edges', 'alpha_mode',
               'incidence_features', 'endemic_features', 'init_from_train', 'endemic_mode',
               'node_effects', 'node_penalty', 'neighbourhood_mode', 'epidemic_mode',
               'seasonal_rates', 'rate_dynamics', 'dynamics_hidden', 'max_log_rate_adj',
-              'dynamics_penalty'}
+              'dynamics_penalty', 'disabled_branches'}
 TRAIN_KEYS = {'lr', 'n_epochs', 'patience', 'min_delta', 'optimizer', 'scheduler',
               'optimizer_kwargs', 'scheduler_kwargs', 'shuffle'}
 # train keys handled by the runner itself, not passed to set_global_hparams
@@ -99,7 +99,7 @@ def validate(cfg: dict) -> None:
     for k in ('disease', 'level', 'lead', 'quantiles', 'dates'):
         if k not in data:
             errors.append(f'data.{k} is missing')
-    if task in ('hhh4', 'graph_controls', 'compare_diseases'):
+    if task in ('hhh4', 'graph_controls', 'compare_diseases', 'ablations', 'recovery'):
         if data.get('graph_file') in (None, '', 'YOUR_GRAPH_FILE'):
             errors.append('data.graph_file is not set (configs/base.yaml): the file name '
                           'you pass to retrieve_static_graph')
@@ -113,9 +113,25 @@ def validate(cfg: dict) -> None:
     bad_model = set(cfg.get('model', {})) - MODEL_KEYS
     if bad_model:
         errors.append(f'unknown model keys {sorted(bad_model)}; allowed: {sorted(MODEL_KEYS)}')
+    for section, entries in [('evaluation.variants', (cfg.get('evaluation', {}) or {}).get('variants') or {}),
+                             ('ablations.variants', (cfg.get('ablations', {}) or {}).get('variants') or {})]:
+        for label, overrides in entries.items():
+            bad = set(overrides or {}) - MODEL_KEYS
+            if bad:
+                errors.append(f'{section}.{label}: unknown model keys {sorted(bad)}')
+    rc = cfg.get('hhh4_r', {}) or {}
+    bad_r = set(rc) - {'enabled', 'rscript', 'nsim', 'seed', 'harmonics', 'max_lag', 'random_effects',
+                       'power_law', 'family'}
+    if bad_r:
+        errors.append(f'unknown hhh4_r keys {sorted(bad_r)}')
     bad_train = set(cfg.get('train', {})) - TRAIN_KEYS - RUNNER_TRAIN_KEYS
     if bad_train:
         errors.append(f'unknown train keys {sorted(bad_train)}; allowed: {sorted(TRAIN_KEYS | RUNNER_TRAIN_KEYS)}')
+
+    ts = data.get('test_seasons')
+    if ts is not None and (not isinstance(ts, list) or not all(isinstance(y, int) for y in ts)):
+        errors.append('data.test_seasons must be a list of years, e.g. [2015, 2016, 2017, 2018] '
+                      '(season = June of that year to June of the next)')
 
     seeds = cfg.get('train', {}).get('seeds', [0])
     if not isinstance(seeds, list) or not seeds:

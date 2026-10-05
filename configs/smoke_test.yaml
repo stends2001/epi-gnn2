@@ -8,3 +8,5 @@ train:
   seeds: [0]
 evaluation:
   figures: false
+hhh4_r:
+  nsim: 50

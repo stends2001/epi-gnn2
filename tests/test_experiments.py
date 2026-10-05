@@ -31,7 +31,8 @@ CONFIGS = ROOT / 'configs'
 def test_all_shipped_configs_resolve():
     for p in CONFIGS.glob('*.yaml'):
         cfg = load_config(p, ['data.graph_file=grid.pt'])
-        assert cfg['task'] in ('baselines', 'hhh4', 'graph_controls', 'compare_diseases')
+        from src.experiments.config import TASKS
+        assert cfg['task'] in TASKS
         assert run_name(cfg)
 
 
@@ -105,6 +106,35 @@ class _SyntheticRunner(Runner):
         return {'persistence': base, 'seasonal_average': seasonal}
 
 
+    def fit_hhh4_r(self, edo, gdb, reference, tag=''):
+        """Real R fit on the synthetic counts (skipped if R is missing)."""
+        import numpy as np
+        import test_diagnostics as T
+        from src.experiments.hhh4r import run_hhh4_r, HHH4RModel, find_rscript
+        find_rscript()                                     # raises RNotAvailable without R
+        t0, week, y = T._simulate(coupling=0.3)
+        counts = pd.DataFrame(y, index=t0)
+        ref = reference.predictions.get_preds('test').get(0, True, False)
+        lead = reference.epiconfig.horizon_leadtime
+        origins = sorted(pd.to_datetime(ref['timestamp']).unique() - pd.Timedelta(weeks=lead))
+        res = run_hhh4_r(counts, T._grid_graph().adjacency_matrix.numpy(), np.full(y.shape[1], 1e5),
+                         fit_end=origins[0], t0_dates=origins, lead=lead,
+                         quantiles=reference.epiconfig.quantiles, folder=self.out / f'hhh4_R{tag}',
+                         spec={'nsim': 50, 'random_effects': False})
+        return HHH4RModel(res, reference.epiconfig)
+
+    def recovery_inputs(self):
+        import numpy as np
+        import test_diagnostics as T
+        t0, week, y = T._simulate(coupling=0.3)
+        return pd.DataFrame(y, index=t0), np.full(y.shape[1], 1e5), T._grid_graph()
+
+
+def _r_available():
+    import shutil
+    return shutil.which('Rscript') is not None
+
+
 def _cfg(task, **extra):
     cfg = load_config(CONFIGS / 'base.yaml', ['data.graph_file=g.pt', f'task={task}',
                                              'train.seeds=[0]', *extra.get('sets', [])])
@@ -112,6 +142,9 @@ def _cfg(task, **extra):
 
 
 @pytest.mark.parametrize('task, sets, expect', [
+    ('ablations', ['ablations.variants={no_gru: {rate_dynamics: none}, no_neighbourhood: {disabled_branches: [neighbourhood]}}',
+                   'hhh4_r.enabled=false'],
+     ['ablation_runs.csv', 'ablation_summary.csv', 'figures/ablation_comparison.png']),
     ('hhh4', ['train.seeds=[0,1]'],
      ['scores_in_season.csv', 'components.csv', 'node_parameters.csv', 'hhh4_over_seeds.csv',
       'figures/decomposition.png', 'figures/node_maps.png']),
@@ -130,3 +163,38 @@ def test_runner_tasks_write_outputs(tmp_path, task, sets, expect):
     # the saved config re-loads and reproduces the run name
     again = load_config(out / 'config.yaml')
     assert run_name(again) == run_name(cfg)
+
+
+@pytest.mark.skipif(not _r_available(), reason='R not installed')
+def test_hhh4_r_reference_in_hhh4_task(tmp_path):
+    cfg = _cfg('hhh4')
+    out = _SyntheticRunner(cfg, out_root=tmp_path, timestamp=False).run()
+    scores = pd.read_csv(out / 'scores_in_season.csv')
+    assert 'hhh4_R' in set(scores['model'])
+    row = scores[scores['model'] == 'hhh4_R'].iloc[0]
+    assert 0 < row['pitcov95'] <= 1 and row['wis'] > 0
+    assert (out / 'hhh4_R_coefficients.csv').exists() and (out / 'hhh4_R_component_table.csv').exists()
+
+
+@pytest.mark.skipif(not _r_available(), reason='R not installed')
+def test_recovery_task(tmp_path):
+    cfg = _cfg('recovery', sets=['recovery.scenarios=[fitted, no_ne]', 'train.n_epochs=15', 'train.patience=5',
+                                 'data.dates.split_trainval=2016-09-01', 'data.dates.split_valtest=2017-03-01',
+                                 'hhh4_r.random_effects=false'])
+    out = _SyntheticRunner(cfg, out_root=tmp_path, timestamp=False).run()
+    rec = pd.read_csv(out / 'recovery.csv')
+    assert set(rec['scenario']) == {'fitted', 'no_ne'}
+    truth = rec[(rec['scenario'] == 'no_ne') & (rec['estimator'] == 'truth')].iloc[0]
+    assert truth['all_share_neighbourhood'] == pytest.approx(0, abs=1e-6)    # no spread simulated
+    assert {'neural_s0', 'hhh4_refit'} <= set(rec['estimator'])
+    assert (out / 'figures' / 'recovery_shares.png').exists()
+
+
+def test_rolling_seasons_pool_scores(tmp_path):
+    cfg = _cfg('hhh4', sets=['data.test_seasons=[2016, 2017]', 'hhh4_r.enabled=false', 'evaluation.figures=false'])
+    out = _SyntheticRunner(cfg, out_root=tmp_path, timestamp=False).run()
+    pooled = pd.read_csv(out / 'all_seasons_scores_in_season.csv')
+    assert set(pooled['season']) == {2016, 2017}
+    assert (out / 'pooled_scores_in_season.csv').exists()
+    assert (out / 'season_2016' / 'summary.txt').exists()
+    assert 'pooled over 2 test seasons' in (out / 'summary.txt').read_text()

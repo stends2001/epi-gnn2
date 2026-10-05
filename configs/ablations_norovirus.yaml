@@ -1,0 +1,7 @@
+# Ablations and model ladder (hhh4 in R, no GRU, full), norovirus, 3 seeds
+extends: base.yaml
+task: ablations
+data:
+  disease: norovirus
+train:
+  seeds: [0, 1, 2]

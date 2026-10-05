@@ -25,7 +25,10 @@ python run.py --list                           # what is available
 |---|---|
 | `smoke_test.yaml` | quick end-to-end check, no figures |
 | `baselines_norovirus.yaml` | Persistence and Seasonal Average, additive and log1p residuals |
-| `hhh4_norovirus.yaml`, `hhh4_campylobacter.yaml`, `hhh4_influenza.yaml` | HHH4 vs baselines, 3 seeds |
+| `hhh4_norovirus.yaml`, `hhh4_campylobacter.yaml`, `hhh4_influenza.yaml` | neural model vs hhh4 in R vs baselines, 3 seeds, one test season |
+| `seasons_norovirus.yaml`, `seasons_campylobacter.yaml`, `seasons_influenza.yaml` | the same over 4 test seasons (2015/16-2018/19), pooled |
+| `ablations_norovirus.yaml`, `ablations_influenza.yaml` | model ladder (hhh4 in R, no GRU, full) and branch ablations |
+| `recovery_norovirus.yaml`, `recovery_influenza.yaml` | simulate from fitted hhh4 with known components, refit, compare |
 | `graph_controls_norovirus.yaml`, `graph_controls_campylobacter.yaml` | real vs identity vs 10 rewired graphs x 5 seeds, permutation p-value (slow) |
 | `compare_diseases.yaml` | norovirus, campylobacter and influenza side by side |
 
@@ -40,6 +43,46 @@ A new experiment is a small YAML file that `extends:` another one and lists only
 what differs. Each run writes `results/<name>/<timestamp>/` with `summary.txt`
 (headline numbers), `log.txt`, `config.yaml` (the resolved config; run it again
 to reproduce), CSV tables and `figures/`.
+
+## hhh4 in R as reference model
+
+`run.py` fits hhh4 (R package `surveillance`) itself whenever `hhh4_r.enabled: true`
+(the default): Python writes counts, graph and population to the run folder, calls
+`Rscript src/experiments/r/hhh4_fit.R`, and reads the forecasts back as model
+`hhh4_R`, which then appears in all score tables and calibration plots.
+
+Setup once: install R, then in R `install.packages("surveillance")`. If `Rscript`
+is not on the PATH, set `hhh4_r.rscript` to its full path. Without R the runs
+still work and say that hhh4_R was skipped.
+
+- Model: region random intercepts and week-of-year seasonality in the endemic,
+  epidemic and neighbourhood parts, power-law neighbourhood weights, NegBin.
+- Lead-L forecasts come from simulating the fitted model forward from each
+  forecast origin (`nsim` paths), as hhh4 forecasts are normally made.
+- Components are one step ahead (`hhh4_R_component_table.csv`); compare them with
+  the neural model at `data.lead: 1`.
+
+## Coverage for counts
+
+Quantiles of a count forecast are whole numbers, so a "50% interval" holds more
+than 50% of the probability, most of all for small counts. For models with a full
+predictive distribution (neural model, hhh4_R) the tables therefore also report
+`pitcov50/80/95`: coverage from the randomised PIT, which is exactly nominal for a
+calibrated count forecast. Read `pitcov`, not `cov`, for these models. The sanity
+report does the same.
+
+## Recovery study and ablations
+
+- `task: recovery` fits hhh4 to the real counts, simulates new series under
+  scenarios with a known split (`fitted`, `no_ne` = no spread between regions,
+  `strong_ne` = 75% via neighbours), refits the neural model and hhh4 on them, and
+  compares the estimated shares and per-region correlations with the truth
+  (`recovery.csv`, `figures/recovery_shares.png`). On test data this showed the
+  neural model inflating the neighbourhood share when there is no spread, which
+  hhh4 did not: the simulated data come from hhh4, so hhh4 has a home advantage.
+- `task: ablations` trains the full model and variants that each change one thing
+  (no GRU, no seasonal rates, no neighbourhood, no epidemic, no node effects), and
+  hhh4_R, on the same seeds; WIS is relative to the full model.
 
 ## Interval mode
 

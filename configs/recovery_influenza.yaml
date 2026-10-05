@@ -1,0 +1,4 @@
+# Component recovery with influenza as the simulation template
+extends: recovery_norovirus.yaml
+data:
+  disease: influenza

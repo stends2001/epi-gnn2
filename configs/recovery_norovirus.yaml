@@ -1,0 +1,8 @@
+# Component recovery: simulate from hhh4 fitted to norovirus, refit neural + hhh4
+extends: base.yaml
+task: recovery
+data:
+  disease: norovirus
+  lead: 1
+train:
+  seeds: [0, 1, 2]

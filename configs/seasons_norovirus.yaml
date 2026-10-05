@@ -1,0 +1,4 @@
+# Norovirus over 4 test seasons (2015/16-2018/19), neural vs hhh4 in R vs baselines
+extends: hhh4_norovirus.yaml
+data:
+  test_seasons: [2015, 2016, 2017, 2018]

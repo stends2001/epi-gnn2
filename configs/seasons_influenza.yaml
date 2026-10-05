@@ -1,0 +1,4 @@
+# Influenza over 4 test seasons (2015/16-2018/19)
+extends: seasons_norovirus.yaml
+data:
+  disease: influenza

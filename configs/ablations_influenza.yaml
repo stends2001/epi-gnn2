@@ -1,0 +1,4 @@
+# Ablations and model ladder, influenza, 3 seeds
+extends: ablations_norovirus.yaml
+data:
+  disease: influenza
