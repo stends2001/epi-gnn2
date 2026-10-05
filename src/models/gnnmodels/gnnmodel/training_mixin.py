@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, TYPE_CHECKING, Literal
+import copy
 import pandas as pd
 import torch 
 from torch.optim.optimizer import Optimizer
@@ -133,7 +134,9 @@ class GNNModelTrainMixin:
             if val_improved:
                 best_val_loss   = val_loss
                 patience_counter= 0
-                best_model_state= self.model.state_dict().copy()
+                # deep copy: state_dict() returns references to the live parameter
+                # tensors, so a shallow copy would be overwritten by later epochs
+                best_model_state= copy.deepcopy(self.model.state_dict())
                 list_patience.append(False)
 
             else:
@@ -141,12 +144,6 @@ class GNNModelTrainMixin:
                 list_patience.append(True)
 
             if patience_counter >= self.patience:
-        
-
-                if best_model_state is not None:
-                    self.model.load_state_dict(best_model_state)
-              
-
                 break              
 
             # Step scheduler => scheduler.step requires val loss
@@ -163,6 +160,10 @@ class GNNModelTrainMixin:
                                           None if val_improved else f"{patience_counter}/{self.patience}",
                                           True if current_lr != new_lr else None
                                           ) 
+
+        # restore the best epoch, whether training stopped early or ran all epochs
+        if best_model_state is not None:
+            self.model.load_state_dict(best_model_state)
                      
         self.monitoring_metrics = pd.DataFrame({'train_loss'    : list_train_loss,
                                                 'val_loss'      : list_val_loss,

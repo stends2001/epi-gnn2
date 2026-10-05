@@ -213,9 +213,7 @@ class PredictionManager:
                     if params.log is not None:
                         df_denorm = reverse_log(df_denorm, col, params.log)
 
-        if self.epiconfig.target_column == 'cases':
-            raise ValueError('not dealt with poissonlosses')
-
+        # 'cases' targets are not transformed (see Finalizer), so nothing to reverse
         return df_denorm
 
     def _validate_columns(self, data: pd.DataFrame) -> pd.DataFrame:

@@ -6,6 +6,8 @@ model_colors = {
     'seasonalaverage'   : "#595959",    
 
     'gcnmodel' : 'blue',
+    'gatmodel' : 'darkorange',
+    'hhh4model': 'crimson',
     'nodemlpmodel' : 'darkgreen'
 }
 

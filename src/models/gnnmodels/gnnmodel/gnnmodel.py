@@ -1,4 +1,4 @@
-from typing import Self, Union, Type, Any
+from typing import Self, Union, Type, Any, Literal
 import torch 
 from torch.optim.optimizer import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler
@@ -15,6 +15,13 @@ from .checkpoint_mixin import GNNModelCheckpointMixin
 from ....dataloading.databuilders import GraphDataBuilder
 from ..utils import Strategy
 from ...basemodel import BaseModel
+
+# How a GNN produces its output:
+#   'point'    : [N, H] tensor (MSE); conformal intervals in interval mode
+#   'quantile' : [N, H, Q] tensor (pinball loss), optionally CQR-corrected
+#   'nb'       : (mu, alpha) tuple (NB loss); quantiles from the NB distribution
+OutputHead = Literal['auto', 'point', 'quantile', 'nb']
+
 
 class GNNModel(
     GNNModelInternalsMixin,
@@ -89,7 +96,12 @@ class GNNModel(
         super().__init__(databuilder, name)        
     
         self.evaluation_datasets                            = {}
-        self._residual_quantiles: dict[tuple[int, int], dict[int, float]] = {}
+
+        # output type; set in set_model_hparams via _set_output_head
+        self.output_head:  OutputHead = 'point'
+        self.conformalize: bool       = False
+        # calibration info from the conformal / CQR step, per horizon
+        self.calibration_offsets: dict[int, Any] = {}
 
         # using hidden methods in DeepModelInternalsMixin, set attributes
         self._set_device()
@@ -158,7 +170,7 @@ class GNNModel(
         child_cls = cls._childclasses[model_key]
         instance  = child_cls(
             name              = save_dict['name'],
-            databuilder = GraphDataBuilder,
+            databuilder = databuilder,
         ) # type: ignore
         
         databuilder.dataorchestrator.config.assert_equals(save_dict['epiconfig_summary'], level = 1)
@@ -184,6 +196,23 @@ class GNNModel(
         instance._update_status('trained')
 
         return instance
+
+    def _set_output_head(self, output_head: OutputHead, conformalize: bool = False) -> None:
+        """Resolve and validate the output head against the prediction mode."""
+        interval_mode = self.epiconfig._prediction_mode == 'interval'
+
+        if output_head == 'auto':
+            output_head = 'quantile' if interval_mode else 'point'
+
+        if output_head == 'quantile' and not interval_mode:
+            raise ValueError("output_head='quantile' needs quantiles in EpiConfig (interval mode).")
+
+        if conformalize and output_head != 'quantile':
+            raise ValueError("conformalize=True only applies to output_head='quantile'. "
+                             "Point heads are conformalized automatically in interval mode.")
+
+        self.output_head  = output_head
+        self.conformalize = conformalize
 
     def set_model_hparams(self) -> None:
         """must be set by subclasses"""
