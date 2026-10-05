@@ -72,8 +72,10 @@ ri_f <- function(intercept_only = FALSE) {
 }
 weights <- if (power_law) W_powerlaw(maxlag = max_lag, normalize = TRUE, log = TRUE) else neighbourhood(sts_obj) == 1
 
+# without random effects: region-specific fixed endemic intercepts (as hhh4py)
+end_f <- function() if (use_ri) ri_f() else update(ri_f(), ~ . + fe(1, unitSpecific = TRUE) - 1)
 make_control <- function() list(
-  end = list(f = ri_f(), offset = population(sts_obj)),
+  end = list(f = end_f(), offset = population(sts_obj)),
   ar  = list(f = ri_f()),
   ne  = list(f = ri_f(), weights = weights),
   family = family,
@@ -84,9 +86,7 @@ fit <- tryCatch(hhh4(sts_obj, make_control()), error = function(e) e)
 if (inherits(fit, "error") || !isTRUE(fit$convergence)) {
   message("hhh4 with random effects failed or did not converge; refitting with unit-specific fixed endemic intercepts")
   use_ri <- FALSE
-  ctrl <- make_control()
-  ctrl$end$f <- update(ctrl$end$f, ~ . + fe(1, unitSpecific = TRUE) - 1)
-  fit <- hhh4(sts_obj, ctrl)
+  fit <- hhh4(sts_obj, make_control())
 }
 runtime <- as.numeric(difftime(Sys.time(), t_start, units = "secs"))
 

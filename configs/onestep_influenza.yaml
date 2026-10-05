@@ -1,0 +1,6 @@
+# Influenza 4 weeks ahead: direct neural model vs the same model trained one
+# week ahead and simulated forward (neural_hhh4_sim), with hhh4 (Python) as reference
+extends: hhh4_influenza.yaml
+name: onestep_influenza
+train:
+  one_step: true

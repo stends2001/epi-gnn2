@@ -2,11 +2,13 @@
 extends: base.yaml
 task: hhh4
 name: smoke_test
+evaluation:
+  figures: false
+hhh4_py:
+  nsim: 50
 train:
   n_epochs: 3
   patience: 3
   seeds: [0]
-evaluation:
-  figures: false
-hhh4_r:
-  nsim: 50
+  one_step: true
+  sim_nsim: 20

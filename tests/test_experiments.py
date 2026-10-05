@@ -123,6 +123,26 @@ class _SyntheticRunner(Runner):
                          spec={'nsim': 50, 'random_effects': False})
         return HHH4RModel(res, reference.epiconfig)
 
+    def fit_hhh4_py(self, edo, gdb, reference, tag=''):
+        import numpy as np
+        import test_diagnostics as T
+        from src.experiments.onestep import hhh4_py_model, reference_origins
+        t0, week, y = T._simulate(coupling=0.3)
+        lead = reference.epiconfig.horizon_leadtime
+        origins = reference_origins(reference, lead)
+        return hhh4_py_model(pd.DataFrame(y, index=t0), T._grid_graph().adjacency_matrix.numpy(),
+                             np.full(y.shape[1], 1e5), origins[0], origins, lead, reference.epiconfig,
+                             spec={'nsim': 50, 'random_effects': False})
+
+    def fit_neural_sim(self, edo, reference, seed, tag=''):
+        import test_diagnostics as T
+        from src.experiments.onestep import neural_sim_model, reference_origins
+        m1, _, _ = T._build(coupling=0.3, epochs=8)            # trained one week ahead
+        t0, week, y = T._simulate(coupling=0.3)
+        lead = 2
+        return neural_sim_model(m1, pd.DataFrame(y, index=t0), reference_origins(reference, lead), lead,
+                                reference.epiconfig, nsim=20, seed=seed)
+
     def recovery_inputs(self):
         import numpy as np
         import test_diagnostics as T
@@ -145,14 +165,20 @@ def _cfg(task, **extra):
     ('ablations', ['ablations.variants={no_gru: {rate_dynamics: none}, no_neighbourhood: {disabled_branches: [neighbourhood]}}',
                    'hhh4_r.enabled=false'],
      ['ablation_runs.csv', 'ablation_summary.csv', 'figures/ablation_comparison.png']),
-    ('hhh4', ['train.seeds=[0,1]'],
+    ('hhh4', ['train.seeds=[0,1]', 'train.one_step=true'],
      ['scores_in_season.csv', 'components.csv', 'node_parameters.csv', 'hhh4_over_seeds.csv',
+      'hhh4_py_component_table.csv', 'neural_hhh4_sim_component_table.csv',
       'figures/decomposition.png', 'figures/node_maps.png']),
     ('baselines', [], ['scores_in_season.csv', 'scores_all_weeks.csv', 'figures/calibration.png']),
     ('graph_controls', ['graph_controls.n_rewired=2'],
      ['runs.csv', 'summary_by_graph.csv', 'figures/graph_controls.png']),
     ('compare_diseases', ['compare.diseases=[norovirus,campylobacter]', 'evaluation.figures=false'],
      ['scores_in_season.csv', 'components_in_season.csv']),
+    ('attribution', ['attribution.sources=[sir_c0.3, hhh4_no_ne]', 'attribution.replicates=[0]',
+                     'attribution.years=4', 'attribution.side=2', 'attribution.nsim=20', 'train.n_epochs=3',
+                     'attribution.estimators=[hhh4py, neural_lead1, neural_leadL, anchored]',
+                     'attribution.anchor_weights=[1]'],
+     ['attribution_runs.csv', 'attribution_summary.csv', 'figures/attribution_error.png']),
 ])
 def test_runner_tasks_write_outputs(tmp_path, task, sets, expect):
     cfg = _cfg(task, sets=sets)
@@ -165,9 +191,19 @@ def test_runner_tasks_write_outputs(tmp_path, task, sets, expect):
     assert run_name(again) == run_name(cfg)
 
 
+def test_reference_models_scored(tmp_path):
+    cfg = _cfg('hhh4', sets=['train.one_step=true', 'evaluation.figures=false'])
+    out = _SyntheticRunner(cfg, out_root=tmp_path, timestamp=False).run()
+    scores = pd.read_csv(out / 'scores_in_season.csv')
+    for label in ('hhh4_py', 'neural_hhh4_sim'):
+        row = scores[scores['model'] == label].iloc[0]
+        assert 0 < row['pitcov95'] <= 1 and row['wis'] > 0
+    assert 'hhh4_py one-step components' in (out / 'summary.txt').read_text()
+
+
 @pytest.mark.skipif(not _r_available(), reason='R not installed')
 def test_hhh4_r_reference_in_hhh4_task(tmp_path):
-    cfg = _cfg('hhh4')
+    cfg = _cfg('hhh4', sets=['hhh4_r.enabled=true'])
     out = _SyntheticRunner(cfg, out_root=tmp_path, timestamp=False).run()
     scores = pd.read_csv(out / 'scores_in_season.csv')
     assert 'hhh4_R' in set(scores['model'])
@@ -176,17 +212,16 @@ def test_hhh4_r_reference_in_hhh4_task(tmp_path):
     assert (out / 'hhh4_R_coefficients.csv').exists() and (out / 'hhh4_R_component_table.csv').exists()
 
 
-@pytest.mark.skipif(not _r_available(), reason='R not installed')
 def test_recovery_task(tmp_path):
     cfg = _cfg('recovery', sets=['recovery.scenarios=[fitted, no_ne]', 'train.n_epochs=15', 'train.patience=5',
                                  'data.dates.split_trainval=2016-09-01', 'data.dates.split_valtest=2017-03-01',
-                                 'hhh4_r.random_effects=false'])
+                                 'hhh4_py.random_effects=false', 'recovery.anchor_weights=[5]'])
     out = _SyntheticRunner(cfg, out_root=tmp_path, timestamp=False).run()
     rec = pd.read_csv(out / 'recovery.csv')
     assert set(rec['scenario']) == {'fitted', 'no_ne'}
     truth = rec[(rec['scenario'] == 'no_ne') & (rec['estimator'] == 'truth')].iloc[0]
     assert truth['all_share_neighbourhood'] == pytest.approx(0, abs=1e-6)    # no spread simulated
-    assert {'neural_s0', 'hhh4_refit'} <= set(rec['estimator'])
+    assert {'neural_s0', 'hhh4_refit', 'anchored_k5_s0'} <= set(rec['estimator'])
     assert (out / 'figures' / 'recovery_shares.png').exists()
 
 

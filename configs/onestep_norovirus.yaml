@@ -1,0 +1,4 @@
+extends: hhh4_norovirus.yaml
+name: onestep_norovirus
+train:
+  one_step: true

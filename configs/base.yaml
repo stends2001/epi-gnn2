@@ -1,7 +1,7 @@
 # Shared defaults; every other config extends this file.
 # Set data.graph_file once here.
 
-task: hhh4                 # baselines | hhh4 | graph_controls | compare_diseases
+task: hhh4                 # baselines | hhh4 | graph_controls | compare_diseases | ablations | recovery | attribution
 name: null                 # output folder name; default: <task>_<disease>_<level>_lead<N>
 output_dir: results
 
@@ -49,6 +49,10 @@ train:                     # HHH4Model.set_global_hparams, plus seeds
   shuffle: true            # new training order every epoch, so seeds differ
   calibrate_dispersion: true   # rescale NB spread to minimise val in-season WIS
   seeds: [0]
+  one_step: false          # also train the model ONE week ahead and forecast data.lead weeks
+                           # ahead by simulation (model 'neural_hhh4_sim'; one-step components,
+                           # comparable with hhh4)
+  sim_nsim: 200            # simulated paths per forecast origin for one_step
 
 evaluation:
   season: in               # in | off | null (all weeks)
@@ -57,8 +61,17 @@ evaluation:
   nodes_to_plot: [0, 1, 2]
   variants: {}             # extra neural variants to compare, e.g. {no_gru: {rate_dynamics: none}}
 
-hhh4_r:                    # hhh4 fitted in R (package surveillance) as reference model
-  enabled: true            # skipped with a note if R is not installed
+hhh4_py:                   # hhh4 in Python (no R needed) as reference model 'hhh4_py'
+  enabled: true
+  nsim: 500                # simulated paths per forecast origin
+  seed: 1
+  harmonics: 1             # sin/cos pairs for the seasonality of each component
+  random_effects: true     # region random intercepts (independent per component)
+  power_law: true          # neighbourhood weights decaying with neighbourhood order
+  max_lag: 5
+
+hhh4_r:                    # hhh4 fitted in R (package surveillance), optional cross-check 'hhh4_R'
+  enabled: false           # needs R; skipped with a note if R is not installed
   rscript: Rscript         # full path if Rscript is not on the PATH
   nsim: 500                # simulated paths per forecast origin (lead > 1)
   harmonics: 1             # sin/cos pairs for the seasonality of each component
@@ -78,8 +91,19 @@ ablations:                 # task: ablations - each variant changes the full mod
 recovery:                  # task: recovery - simulate from fitted hhh4, refit, compare
   scenarios: [fitted, no_ne, strong_ne]
   lead: 1                  # components are compared one step ahead, as hhh4 defines them
-  refit_hhh4: true
   sim_seed: 1
+  anchor_weights: []       # e.g. [1, 10]: also train the neural model anchored on the hhh4 split
+
+attribution:               # task: attribution - simulation study, no data needed
+  sources: [sir_c0.0, sir_c0.3, sir_c0.6, hhh4_fitted, hhh4_no_ne, hhh4_strong_ne]
+  replicates: [0, 1, 2]
+  side: 4                  # grid of side x side regions
+  years: 9                 # 7 train, 1 val, 1 test
+  lead: 4
+  nsim: 200
+  template_coupling: 0.3   # SIR series the hhh4 template is fitted to
+  estimators: [hhh4py, neural_lead1, neural_leadL]   # + anchored
+  anchor_weights: [1, 10]
 
 graph_controls:
   n_rewired: 10

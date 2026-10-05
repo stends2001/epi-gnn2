@@ -276,15 +276,13 @@ class Runner:
         models = {'neural_hhh4': m}
         for label, extra in self._extra_neural_variants(gdb, seeds[0]).items():
             models[label] = extra
-        r_model = self._maybe_hhh4_r(edo, gdb, m)
-        if r_model is not None:
-            models['hhh4_R'] = r_model
+        refs = self._reference_models(edo, gdb, m, seed=seeds[0])
+        models.update(refs)
         models.update(baselines)
         scores = compare_models(models, season=ev.get('season', 'in'), reference=self._reference(baselines))
         self._table(scores, 'scores_in_season')
         self._note_scores(scores, f'seed {seeds[0]}, in season')
-        if r_model is not None:
-            self._report_hhh4_r(r_model, m)
+        self._report_references(refs)
 
         cal = getattr(m, 'dispersion_calibration', None)
         if cal is not None:
@@ -317,11 +315,65 @@ class Runner:
             with contextlib.suppress(ValueError):
                 self._fig(dg.plot_seasonal_curves(m), 'seasonal_curves')
             self._fig(dg.plot_calibration(models), 'calibration')
-            self._fig(dg.plot_lag_check({k: v for k, v in models.items() if k != 'hhh4_R'}), 'lag_check')
+            self._fig(dg.plot_lag_check({k: v for k, v in models.items() if k not in refs}), 'lag_check')
             self._fig(dg.plot_pred_vs_obs(m), 'pred_vs_obs')
             self._fig(dg.plot_model_comparison(scores), 'model_comparison')
 
-    # ---- hhh4 in R and model variants -------------------------------------
+    # ---- reference models: hhh4 (Python, R) and the one-step neural model ----
+    def fit_hhh4_py(self, edo, gdb, reference, tag: str = ''):
+        """hhh4 in Python on the same data, graph and forecast rows as ``reference`` (overridable)."""
+        from .hhh4r import pipeline_counts
+        from .onestep import hhh4_py_model, reference_origins
+        rc = {k: v for k, v in self.cfg.get('hhh4_py', {}).items() if k != 'enabled'}
+        counts, pop = pipeline_counts(edo)
+        lead = int(edo.config.horizon_leadtime)
+        fit_end = pd.Timestamp(edo.data_context.temporal_summary.split_valtest) - pd.Timedelta(days=1)
+        return hhh4_py_model(counts, gdb.graph.adjacency_matrix.cpu().numpy(), pop, fit_end,
+                             reference_origins(reference, lead), lead, edo.config, spec=rc)
+
+    def fit_neural_sim(self, edo, reference, seed: int, tag: str = ''):
+        """
+        The neural model trained ONE week ahead, forecasting ``data.lead`` weeks
+        ahead by simulation (overridable). Its components are one-step routes,
+        comparable with hhh4's.
+        """
+        from .hhh4r import pipeline_counts
+        from .onestep import neural_sim_model, reference_origins
+        lead = int(self.cfg['data']['lead'])
+        saved = self.cfg['data']['lead']
+        self.cfg['data']['lead'] = 1
+        try:
+            edo1, _ = self.build_data(getattr(edo.config, 'disease', None))
+            m1 = self.train_hhh4(self.graph_builder(edo1, 'real'),
+                                 name=f"onestep_{self.cfg['data']['disease']}_s{seed}{tag}", seed=seed)
+        finally:
+            self.cfg['data']['lead'] = saved
+        counts, _ = pipeline_counts(edo1)
+        return neural_sim_model(m1, counts, reference_origins(reference, lead), lead, edo.config,
+                                nsim=int(self.cfg.get('train', {}).get('sim_nsim', 200)), seed=seed)
+
+    def _reference_models(self, edo, gdb, reference, seed: int = 0, tag: str = '') -> dict:
+        """hhh4_py, hhh4_R and neural_hhh4_sim, as enabled in the config; failures are noted, not fatal."""
+        out = {}
+        if self.cfg.get('hhh4_py', {}).get('enabled', True):
+            print('\n-- fitting hhh4 in Python (reference model)')
+            try:
+                t = time.time()
+                m = self.fit_hhh4_py(edo, gdb, reference, tag)
+                out['hhh4_py'] = m
+                print(f"   converged={m.info.get('converged')} loglik={m.info.get('loglik', float('nan')):.1f} "
+                      f"({time.time() - t:.0f} s)")
+            except Exception as e:
+                print(f'   hhh4 in Python failed: {e}')
+                self.summary.append(f'hhh4_py failed: {str(e).splitlines()[0]}')
+        r_model = self._maybe_hhh4_r(edo, gdb, reference, tag)
+        if r_model is not None:
+            out['hhh4_R'] = r_model
+        if self.cfg.get('train', {}).get('one_step', False):
+            print('\n-- neural model trained one week ahead, forecasting by simulation')
+            out['neural_hhh4_sim'] = self.fit_neural_sim(edo, reference, seed, tag)
+        return out
+
     def fit_hhh4_r(self, edo, gdb, reference, tag: str = ''):
         """hhh4 fitted in R on the same data, graph and forecast rows (overridable)."""
         from .hhh4r import hhh4_r_from_pipeline
@@ -351,20 +403,23 @@ class Runner:
               f"runtime={float(info.get('runtime_s', 0)):.0f}s")
         return r_model
 
-    def _report_hhh4_r(self, r_model, neural) -> None:
-        """Parameter and one-step component tables of hhh4_R, and the comparison line."""
-        self._table(r_model.coefficients, 'hhh4_R_coefficients', show=False)
-        self._table(r_model.unit_effects, 'hhh4_R_unit_effects', show=False)
-        self._table(r_model.components, 'hhh4_R_components_one_step', show=False)
-        ct = r_model.component_table()
-        self._table(ct, 'hhh4_R_component_table')
-        ins = ct[ct['period'] == 'in-season']
-        if len(ins):
-            r = ins.iloc[0]
-            self.summary.append(
-                f"hhh4_R one-step components in season: endemic {r['share_endemic']:.2f}, "
-                f"epidemic {r['share_epidemic']:.2f}, neighbourhood {r['share_neighbourhood']:.2f} "
-                f"(compare with neural_hhh4 at lead 1)")
+    def _report_references(self, refs: dict) -> None:
+        """Parameter and one-step component tables of the reference models."""
+        for label, r in refs.items():
+            for attr in ('coefficients', 'unit_effects'):
+                if getattr(r, attr, None) is not None:
+                    self._table(getattr(r, attr), f'{label}_{attr}', show=False)
+            if getattr(r, 'components', None) is None:
+                continue
+            self._table(r.components, f'{label}_components_one_step', show=False)
+            ct = r.component_table()
+            self._table(ct, f'{label}_component_table')
+            ins = ct[ct['period'] == 'in-season']
+            if len(ins):
+                x = ins.iloc[0]
+                self.summary.append(
+                    f"{label} one-step components in season: endemic {x['share_endemic']:.2f}, "
+                    f"epidemic {x['share_epidemic']:.2f}, neighbourhood {x['share_neighbourhood']:.2f}")
 
     def _extra_neural_variants(self, gdb, seed: int) -> dict:
         """Optional comparison variants of the neural model (evaluation.variants)."""
@@ -409,10 +464,9 @@ class Runner:
                 models[label] = self.train_hhh4_variant(gdb, f'{label}_s{seed}', seed, overrides)
             if seed == seeds[0]:
                 first = dict(models)
-                r_model = self._maybe_hhh4_r(edo, gdb, full)
-                if r_model is not None:
-                    models['hhh4_R'] = r_model
-                    first['hhh4_R'] = r_model
+                refs = self._reference_models(edo, gdb, full, seed=seed)
+                models.update(refs)
+                first.update(refs)
             tab = compare_models({**models, **baselines}, season=ev.get('season', 'in'), reference='full')
             tab.insert(0, 'seed', seed)
             rows.append(tab)
@@ -455,48 +509,67 @@ class Runner:
         on them, and compare the estimated split with the truth.
         """
         import matplotlib.pyplot as plt
-        from .recovery import simulate_from_hhh4, train_neural_on_counts, recovery_table
-        from .hhh4r import run_hhh4_r
+        from .recovery import train_neural_on_counts, recovery_table
+        from .onestep import fit_hhh4_py
         from ..models.utils.intervalmetrics import season_weeks_for
         from ..models import diagnostics as dg
 
         rc = self.cfg.get('recovery', {})
-        r_spec = {k: v for k, v in self.cfg.get('hhh4_r', {}).items() if k not in ('enabled', 'rscript')}
-        rscript = self.cfg.get('hhh4_r', {}).get('rscript')
+        h_spec = {k: v for k, v in self.cfg.get('hhh4_py', {}).items() if k != 'enabled'}
         scenarios = rc.get('scenarios', ['fitted', 'no_ne', 'strong_ne'])
         lead = int(rc.get('lead', 1))
         seq_len = int(self.cfg['data'].get('sequence_length', 4))
         seeds = self.cfg.get('train', {}).get('seeds', [0])
+        anchors = [float(k) for k in (rc.get('anchor_weights') or [])]
         dates = self.cfg['data']['dates']
         splits = {'trainval': pd.Timestamp(dates['split_trainval']), 'valtest': pd.Timestamp(dates['split_valtest'])}
         season = season_weeks_for(self.cfg['data']['disease'])
 
         counts, pop, graph = self.recovery_inputs()
+        counts = counts.sort_index()
+        idx = pd.to_datetime(counts.index)
         adjacency = graph.adjacency_matrix.cpu().numpy()
-        print(f'\n-- simulating {scenarios} from hhh4 fitted to the real counts')
-        sims = simulate_from_hhh4(counts, adjacency, pop, splits['valtest'] - pd.Timedelta(days=1), scenarios,
-                                  self.out / 'simulations', spec={**r_spec, 'nsim': 1}, rscript=rscript,
-                                  sim_seed=int(rc.get('sim_seed', 1)))
+        fit_end = splits['valtest'] - pd.Timedelta(days=1)
+        print(f'\n-- fitting hhh4 (Python) to the real counts as simulation template')
+        template = fit_hhh4_py(counts, adjacency, pop, fit_end, h_spec)
+        n_test0 = int(np.searchsorted(idx.values, np.datetime64(splits['valtest'])))
+        n_train = int(np.searchsorted(idx.values, np.datetime64(splits['trainval'])))
         tables = []
-        for sc, (sim, truth) in sims.items():
+        for sc in scenarios:
+            y, truth = template.simulate_series(sc, seed=int(rc.get('sim_seed', 1)))
+            if y is None:
+                print(f'-- {sc}: simulated process exploded, skipped')
+                self.summary.append(f'recovery, scenario {sc}: simulation exploded, skipped')
+                continue
+            sim = pd.DataFrame(y, index=counts.index)
+            truth['date'] = idx[truth['row'].to_numpy()]
+            truth = truth.drop(columns='row')
+            pd.DataFrame(y, index=counts.index).to_csv(self.out / f'simulated_{sc}.csv')
             estimates = {}
+            print(f'-- {sc}: refitting hhh4')
+            h = fit_hhh4_py(sim, adjacency, pop, fit_end, h_spec)
+            c = h.fitted_components(np.arange(max(n_test0, 1), len(idx)))
+            c['date'] = idx[c['row'].to_numpy()]
+            estimates['hhh4_refit'] = c.drop(columns='row')
             for seed in seeds:
                 print(f'\n-- {sc}: neural model, seed {seed}')
                 _, comp = train_neural_on_counts(sim, graph, splits, self.cfg.get('model', {}),
                                                  self.cfg.get('train', {}), seq_len=seq_len, lead=lead, seed=seed)
                 estimates[f'neural_s{seed}'] = comp()
-            if rc.get('refit_hhh4', True):
-                print(f'-- {sc}: refitting hhh4')
-                t0s = sim.index[(sim.index >= splits['valtest'] - pd.Timedelta(weeks=lead))][:-lead]
-                res = run_hhh4_r(sim, adjacency, pop, splits['valtest'] - pd.Timedelta(days=1), t0s, lead,
-                                 list(self.cfg['data']['quantiles']), self.out / f'refit_{sc}',
-                                 spec={**r_spec, 'nsim': 50}, rscript=rscript)
-                c = res['components']
-                c['date'] = res['dates'].iloc[(c['row'] - 1).to_numpy()].to_numpy()
-                estimates['hhh4_refit'] = c.drop(columns='row')
+                if anchors and lead == 1:
+                    anc = h.fitted_components(np.arange(1, n_train))
+                    anc['date'] = idx[anc['row'].to_numpy()]
+                    for k in anchors:
+                        print(f'-- {sc}: neural model anchored on hhh4 (weight {k:g}), seed {seed}')
+                        _, comp = train_neural_on_counts(sim, graph, splits, self.cfg.get('model', {}),
+                                                         self.cfg.get('train', {}), seq_len=seq_len, lead=1,
+                                                         seed=seed, anchor=anc.drop(columns='row'), anchor_weight=k)
+                        estimates[f'anchored_k{k:g}_s{seed}'] = comp()
             tab = recovery_table(truth, estimates, season)
             tab.insert(0, 'scenario', sc)
             tables.append(tab)
+        if not tables:
+            return
         res = pd.concat(tables, ignore_index=True)
         self._table(res, 'recovery')
 
@@ -528,6 +601,57 @@ class Runner:
         axes[0, 0].legend(frameon=False, fontsize=9, loc='upper center', bbox_to_anchor=(0.5, -0.3), ncol=3)
         fig.tight_layout()
         self._fig(fig, 'recovery_shares')
+
+    def task_attribution(self):
+        """
+        Simulation study, no surveillance data needed: on series with a KNOWN
+        endemic / epidemic / neighbourhood split (model-neutral SIR waves on a
+        grid, and hhh4-generated series), does a model trained one week ahead
+        attribute cases to the right route better than one trained L weeks ahead
+        directly, and how do both compare with hhh4? Also scores the lead-L
+        forecasts of every estimator.
+        """
+        import matplotlib.pyplot as plt
+        from .attribution import run_study, COMPS
+        from ..models import diagnostics as dg
+
+        ac = self.cfg.get('attribution', {})
+        lead = int(ac.get('lead', 4))
+        res = run_study(list(ac.get('sources', ['sir_c0.0', 'sir_c0.3', 'sir_c0.6', 'hhh4_fitted', 'hhh4_no_ne',
+                                                'hhh4_strong_ne'])),
+                        list(ac.get('replicates', [0, 1, 2])), self.cfg.get('model', {}), self.cfg.get('train', {}),
+                        side=int(ac.get('side', 4)), years=int(ac.get('years', 9)), lead=lead,
+                        seq_len=int(self.cfg['data'].get('sequence_length', 4)),
+                        quantiles=list(self.cfg['data']['quantiles']), nsim=int(ac.get('nsim', 200)),
+                        template_coupling=float(ac.get('template_coupling', 0.3)),
+                        estimators=tuple(ac.get('estimators', ['hhh4py', 'neural_lead1', 'neural_leadL'])),
+                        anchor_weights=tuple(ac.get('anchor_weights', [1.0, 10.0])))
+        self._table(res, 'attribution_runs', show=False)
+        est = res[res['estimator'] != 'truth']
+        cols = ['share_abs_error', f'wis_lead{lead}'] + [f'in_season_share_{k}' for k in COMPS]
+        summ = est.groupby(['source', 'estimator'])[cols].mean().reset_index()
+        truth = res[res['estimator'] == 'truth'].groupby('source')[[f'in_season_share_{k}' for k in COMPS]].mean()
+        self._table(summ, 'attribution_summary')
+        self._table(truth.reset_index(), 'attribution_truth', show=False)
+        overall = est.groupby('estimator')[['share_abs_error', f'wis_lead{lead}']].mean()
+        self._table(overall.reset_index(), 'attribution_overall')
+        self.summary.append('attribution error (half the L1 distance of in-season shares to the truth; 0 = exact):')
+        for e, r in overall.sort_values('share_abs_error').iterrows():
+            self.summary.append(f"  {e:16s} share error {r['share_abs_error']:.3f}   lead-{lead} WIS {r[f'wis_lead{lead}']:.3f}")
+
+        sources = list(dict.fromkeys(summ['source']))
+        names = list(dict.fromkeys(summ['estimator']))
+        fig, ax = plt.subplots(figsize=(1.6 * len(sources) + 3, 4))
+        w = 0.8 / max(len(names), 1)
+        for i, n in enumerate(names):
+            g = summ[summ['estimator'] == n].set_index('source').reindex(sources)
+            ax.bar(np.arange(len(sources)) + i * w, g['share_abs_error'], width=w, label=n,
+                   color=dg.plots.SERIES_COLORS[i % len(dg.plots.SERIES_COLORS)])
+        ax.set_xticks(np.arange(len(sources)) + 0.4 - w / 2, sources, rotation=20)
+        ax.legend(frameon=False, fontsize=9)
+        dg.plots._style(ax, 'attribution error by data source', 'share error (0 = exact)')
+        fig.tight_layout()
+        self._fig(fig, 'attribution_error')
 
     def task_graph_controls(self):
         from ..models.utils.intervalmetrics import evaluate_model_intervals
@@ -606,11 +730,7 @@ class Runner:
             m = self.train_hhh4(self.graph_builder(edo, 'real'), name=f'hhh4_{disease}', seed=seed)
             models[disease] = m
             baselines = self.fit_baselines(db)
-            extra = {}
-            if self.cfg.get('hhh4_r', {}).get('enabled', False):
-                r_model = self._maybe_hhh4_r(edo, self.graph_builder(edo, 'real'), m, tag=f'_{disease}')
-                if r_model is not None:
-                    extra['hhh4_R'] = r_model
+            extra = self._reference_models(edo, self.graph_builder(edo, 'real'), m, seed=seed, tag=f'_{disease}')
             tab = compare_models({'neural_hhh4': m, **extra, **baselines}, season='in',
                                  reference=self._reference(baselines))
             tab.insert(0, 'disease', disease)

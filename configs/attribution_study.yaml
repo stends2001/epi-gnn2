@@ -1,0 +1,13 @@
+# Simulation study (no surveillance data, no R): does a one-week-ahead model
+# attribute cases to the right route (endemic / epidemic / neighbourhood) better
+# than a direct 4-week-ahead model, and how do both compare with hhh4?
+#   python run.py configs/attribution_study.yaml
+#   quick look: --set attribution.replicates=[0] attribution.sources=[sir_c0.3,hhh4_fitted]
+extends: base.yaml
+task: attribution
+name: attribution_study
+train:
+  n_epochs: 80
+  patience: 15
+attribution:
+  estimators: [hhh4py, neural_lead1, neural_leadL, anchored]

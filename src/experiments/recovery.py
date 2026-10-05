@@ -111,12 +111,20 @@ def _snapshots(counts: pd.DataFrame, graph, seq_len: int, lead: int):
 
 
 def train_neural_on_counts(counts: pd.DataFrame, graph, splits: dict, model_cfg: dict, train_cfg: dict,
-                           seq_len: int = 4, lead: int = 1, seed: int = 0, verbose: bool = False):
+                           seq_len: int = 4, lead: int = 1, seed: int = 0, verbose: bool = False,
+                           anchor: pd.DataFrame | None = None, anchor_weight: float = 1.0):
     """
     Train an HHH4Module on a count matrix (features: case window + week-of-year
     sin/cos, like the pipeline with ``target_column='cases'``). ``splits`` holds
     the date boundaries ``trainval`` and ``valtest`` (by target date). Returns
     the module and a function giving its components on the test targets.
+
+    ``anchor``: one-step components of a fitted hhh4 (date, node, endemic,
+    epidemic, neighbourhood) for the training weeks. The training loss then adds
+    ``anchor_weight`` x the mean squared difference of the log components between
+    the neural model and hhh4, so the neural model only moves the split away from
+    hhh4 where that buys likelihood (lead 1 only, where both define the same
+    components).
     """
     from ..models.gnnmodels.architectures.modules import HHH4Module
     from ..models.gnnmodels.utils import LossManager, Strategy
@@ -142,12 +150,36 @@ def train_neural_on_counts(counts: pd.DataFrame, graph, splits: dict, model_cfg:
 
     opt = torch.optim.Adam(m.parameters(), lr=float(train_cfg.get('lr', 5e-3)))
     loss, strat = LossManager('nb'), Strategy()
+
+    anchor_t = None
+    if anchor is not None:
+        if lead != 1:
+            raise ValueError('anchoring to hhh4 components needs lead = 1')
+        a = anchor.set_index(['date', 'node'])[['endemic', 'epidemic', 'neighbourhood']]
+        eps = 0.05 * float(node_means.mean())
+        anchor_t = {}
+        for _, td, s in snaps:
+            if td < tv and td in a.index.get_level_values(0):
+                anchor_t[id(s)] = torch.log(torch.tensor(a.loc[td].reindex(range(N)).to_numpy(), dtype=torch.float32) + eps)
+        log_eps = eps
+
+    def train_step(s):
+        if anchor_t is None or id(s) not in anchor_t:
+            return strat.training_step(m, s, opt, loss)
+        opt.zero_grad()
+        (mu, alpha), parts = m(s.x, s.graph.edge_index, s.graph.edge_weight, return_components=True)
+        l = loss((mu, alpha), s.y) + m.regularization()
+        est = torch.log(torch.stack([parts[k][:, 0] for k in ('endemic', 'epidemic', 'neighbourhood')], 1) + log_eps)
+        l = l + anchor_weight * ((est - anchor_t[id(s)]) ** 2).mean()
+        l.backward()
+        opt.step()
+        return float(l.detach())
     best, best_state, wait = np.inf, None, 0
     patience = int(train_cfg.get('patience', 30))
     for epoch in range(int(train_cfg.get('n_epochs', 300))):
         m.train()
         for i in torch.randperm(len(train)).tolist():
-            strat.training_step(m, train[i], opt, loss)
+            train_step(train[i])
         m.eval()
         v = float(np.mean([strat.validation_step(m, s, loss) for s in val]))
         if v < best - 1e-4:

@@ -17,7 +17,7 @@ from typing import Any
 
 import yaml
 
-TASKS = ('baselines', 'hhh4', 'graph_controls', 'compare_diseases', 'ablations', 'recovery')
+TASKS = ('baselines', 'hhh4', 'graph_controls', 'compare_diseases', 'ablations', 'recovery', 'attribution')
 
 # keys passed straight to HHH4Model.set_model_hparams / set_global_hparams
 MODEL_KEYS = {'hidden_size', 'num_layers', 'dropout', 'norm_edges', 'alpha_mode',
@@ -28,7 +28,7 @@ MODEL_KEYS = {'hidden_size', 'num_layers', 'dropout', 'norm_edges', 'alpha_mode'
 TRAIN_KEYS = {'lr', 'n_epochs', 'patience', 'min_delta', 'optimizer', 'scheduler',
               'optimizer_kwargs', 'scheduler_kwargs', 'shuffle'}
 # train keys handled by the runner itself, not passed to set_global_hparams
-RUNNER_TRAIN_KEYS = {'seeds', 'calibrate_dispersion'}
+RUNNER_TRAIN_KEYS = {'seeds', 'calibrate_dispersion', 'one_step', 'sim_nsim'}
 
 
 class ConfigError(ValueError):
@@ -124,6 +124,15 @@ def validate(cfg: dict) -> None:
                        'power_law', 'family'}
     if bad_r:
         errors.append(f'unknown hhh4_r keys {sorted(bad_r)}')
+    bad_py = set(cfg.get('hhh4_py', {}) or {}) - {'enabled', 'nsim', 'seed', 'harmonics', 'max_lag',
+                                                  'random_effects', 'power_law'}
+    if bad_py:
+        errors.append(f'unknown hhh4_py keys {sorted(bad_py)}')
+    bad_att = set(cfg.get('attribution', {}) or {}) - {'sources', 'replicates', 'side', 'years', 'lead',
+                                                       'nsim', 'estimators', 'anchor_weights',
+                                                       'template_coupling'}
+    if bad_att:
+        errors.append(f'unknown attribution keys {sorted(bad_att)}')
     bad_train = set(cfg.get('train', {})) - TRAIN_KEYS - RUNNER_TRAIN_KEYS
     if bad_train:
         errors.append(f'unknown train keys {sorted(bad_train)}; allowed: {sorted(TRAIN_KEYS | RUNNER_TRAIN_KEYS)}')
