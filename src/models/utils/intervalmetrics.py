@@ -161,16 +161,70 @@ def summarize_intervals(df: pd.DataFrame,
     return pd.concat(parts, ignore_index=True)
 
 
+# --------------------------------------------------------------------------- #
+# seasons
+# --------------------------------------------------------------------------- #
+# Default season windows (ISO weeks, inclusive, may wrap around new year).
+DEFAULT_SEASONS: dict[str, tuple[int, int]] = {
+    'influenza':     (40, 15),
+    'norovirus':     (40, 15),
+    'chickenpox':    (1, 26),
+    'campylobacter': (22, 40),
+}
+
+
+def season_weeks_for(disease: str | None) -> tuple[int, int]:
+    """Season window for a disease; falls back to winter (weeks 40-15)."""
+    return DEFAULT_SEASONS.get(str(disease).lower(), (40, 15))
+
+
+def season_mask(timestamps: pd.Series, start_week: int, end_week: int) -> pd.Series:
+    """True for ISO weeks in [start_week, end_week], wrapping around new year."""
+    week = pd.to_datetime(timestamps).dt.isocalendar().week.astype(int)
+    if start_week <= end_week:
+        return (week >= start_week) & (week <= end_week)
+    return (week >= start_week) | (week <= end_week)
+
+
+def model_prediction_frame(model,
+                           dataset: str = 'test',
+                           horizon: int = 0,
+                           is_original: bool = True,
+                           season: str | None = None,
+                           season_weeks: tuple[int, int] | None = None) -> pd.DataFrame:
+    """
+    A model's stored predictions for one horizon, optionally filtered by season.
+
+    season : None (all weeks), 'in' or 'off'. The window comes from
+        ``season_weeks`` or, if None, from the model's disease
+        (``DEFAULT_SEASONS``). Weeks refer to the target time.
+    """
+    df = model.predictions.get_preds(dataset).get(horizon, is_original, False)
+    if season is None:
+        return df
+    if season not in ('in', 'off'):
+        raise ValueError("season must be None, 'in' or 'off'")
+    weeks = season_weeks or season_weeks_for(getattr(model.epiconfig, 'disease', None))
+    mask  = season_mask(df[model.epiconfig.temporal_column], *weeks)
+    return df[mask if season == 'in' else ~mask].reset_index(drop=True)
+
+
 def evaluate_model_intervals(model,
                              dataset: str = 'test',
                              is_original: bool = True,
-                             group_cols: Iterable[str] | None = None) -> pd.DataFrame:
+                             group_cols: Iterable[str] | None = None,
+                             season: str | None = None,
+                             season_weeks: tuple[int, int] | None = None) -> pd.DataFrame:
     """
     ``summarize_intervals`` for every horizon of a forecasted model, on the
     original scale by default. Adds a ``horizon`` column.
 
     ``group_cols`` may include the node column (``EpiConfig.id_column``) for
     per-node coverage, or a column you merged in yourself (e.g. a size class).
+
+    ``season='in'`` scores only the epidemic season (see ``model_prediction_frame``).
+    Off-season weeks with zero counts are covered by almost any interval and
+    otherwise dominate the pooled coverage.
     """
     quantiles = model.epiconfig.quantiles
     if quantiles is None:
@@ -179,10 +233,45 @@ def evaluate_model_intervals(model,
     coll  = model.predictions.get_preds(dataset)
     parts = []
     for hh in coll.horizons:
-        df  = coll.get(hh, is_original, False)
+        df  = model_prediction_frame(model, dataset, hh, is_original, season, season_weeks)
         out = summarize_intervals(df, quantiles, group_cols)
         out.insert(0, 'horizon', hh)
         parts.append(out)
     res = pd.concat(parts, ignore_index=True)
     res.insert(0, 'model', model.name)
+    if season is not None:
+        res.insert(1, 'season', season)
     return res
+
+
+def compare_models(models,
+                   dataset: str = 'test',
+                   season: str | None = 'in',
+                   reference: str | None = None,
+                   season_weeks: tuple[int, int] | None = None) -> pd.DataFrame:
+    """
+    One row per model and horizon: WIS (and parts), 50/80/95% coverage and width.
+
+    ``models`` is a list or a dict {label: model}. With ``reference`` (a model
+    name or label), adds ``rel_wis`` = WIS / WIS of the reference (< 1 is better).
+    """
+    items = models.items() if isinstance(models, dict) else [(m.name, m) for m in models]
+    rows  = []
+    for label, m in items:
+        res = evaluate_model_intervals(m, dataset, season=season, season_weeks=season_weeks)
+        for hh, g in res.groupby('horizon'):
+            row = {'model': label, 'horizon': hh}
+            for c in ['wis', 'dispersion', 'underprediction', 'overprediction', 'n']:
+                row[c] = g[c].iloc[0]
+            for _, r in g.iterrows():
+                lvl = int(round(r['nominal'] * 100))
+                row[f'cov{lvl}']   = r['coverage']
+                row[f'width{lvl}'] = r['width']
+            rows.append(row)
+    out = pd.DataFrame(rows)
+    if reference is not None:
+        ref = out[out['model'] == reference].set_index('horizon')['wis']
+        if ref.empty:
+            raise ValueError(f'reference {reference!r} not among {out["model"].unique().tolist()}')
+        out['rel_wis'] = out['wis'] / out['horizon'].map(ref)
+    return out

@@ -201,7 +201,9 @@ def _line_graph(n):
 def test_hhh4_components_sum_and_positive():
     N, F, S, H = 5, 3, 2, 2
     m = HHH4Module(N, S, H, incidence_idx=[0], endemic_idx=[1, 2], mu_init=60.0)
-    (mu, alpha), parts = m(torch.randn(N, F, S), _line_graph(N), return_components=True)
+    x = torch.randn(N, F, S)
+    x[:, 0, :] = 60.0 * (0.5 + torch.rand(N, S))           # case counts around the mean
+    (mu, alpha), parts = m(x, _line_graph(N), return_components=True)
     assert mu.shape == (N, H) and alpha.shape == (N, H)
     assert all((p >= 0).all() for p in parts.values())
     assert torch.allclose(sum(parts.values()), mu)
