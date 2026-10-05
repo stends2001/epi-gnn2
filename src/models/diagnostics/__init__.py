@@ -9,6 +9,6 @@ Diagnostics for probabilistic forecasts and the hhh4-style GNN.
 from .components import component_table, component_by_node, compare_components, components_with_target_time
 from .sanity import sanity_report, print_sanity, lag_correlation
 from .plots import (
-    plot_decomposition, plot_component_shares, plot_node_maps, plot_seasonal_curves,
+    plot_decomposition, plot_component_shares, plot_node_maps, plot_seasonal_curves, plot_rate_multipliers,
     plot_calibration, plot_lag_check, plot_pred_vs_obs, plot_model_comparison,
 )

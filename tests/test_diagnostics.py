@@ -111,6 +111,8 @@ def _build(coupling=0.0, epochs=60):
                                   _num_quantiles=len(QS))
     m.device = torch.device('cpu')
     m.status_dict = {'model_hparams_set': True, 'global_hparams_set': True, 'trained': True}
+    m.config_info = {}
+    m.output_head = 'nb'
     m.incidence_features = ['cases_lag0']
     m.endemic_features = ['tt_sin_w', 'tt_cos_w']
     m._get_dataloader = lambda d: splits[d]
@@ -257,6 +259,7 @@ def test_all_plots_render(fitted):
         dg.plot_component_shares(m),
         dg.plot_node_maps(m),
         dg.plot_seasonal_curves(m),
+        dg.plot_rate_multipliers(m, nodes=[0, 4]),
         dg.plot_calibration({'hhh4': m, 'persistence': base}),
         dg.plot_lag_check({'hhh4': m, 'persistence': base}),
         dg.plot_pred_vs_obs(m),
@@ -307,3 +310,60 @@ def test_case_target_is_registered_untransformed():
         cfg = SimpleNamespace(temporal_column='timestamp', id_column='node', target_column=target)
         edo = EpiDataOrchestrator(cfg)
         assert edo.column_registration.get_entry_by_name('target').transformation is transformed
+
+
+# --------------------------------------------------------------------------- #
+# time-varying rates, dispersion calibration, seeds
+# --------------------------------------------------------------------------- #
+def test_recurrent_rates_start_at_plain_form_and_are_bounded():
+    torch.manual_seed(0)
+    x = torch.rand(N, 3, S) * 50
+    g = _grid_graph()
+    plain = HHH4Module(N, S, H, [0], [1, 2], mu_init=25., rate_dynamics='none', seasonal_rates=False)
+    gru   = HHH4Module(N, S, H, [0], [1, 2], mu_init=25., rate_dynamics='gru', seasonal_rates=True,
+                       max_log_rate_adj=1.0)
+    gru.load_state_dict(plain.state_dict(), strict=False)
+    (mu_p, _), _ = plain(x, g.edge_index, g.edge_weight, return_components=True)
+    (mu_g, _), _ = gru(x, g.edge_index, g.edge_weight, return_components=True)
+    assert torch.allclose(mu_p, mu_g)                         # zero-initialised shift and seasonal terms
+    with torch.no_grad():
+        gru.dyn_head.bias.fill_(100.0)                        # push the shift to its bound
+    _, parts = gru(x, g.edge_index, g.edge_weight, return_components=True)
+    _, parts_p = plain(x, g.edge_index, g.edge_weight, return_components=True)
+    ratio = parts['epidemic'] / parts_p['epidemic']
+    assert torch.allclose(ratio, torch.full_like(ratio, np.e), rtol=1e-4)   # exp(max_log_rate_adj)
+    assert gru.regularization() > 0
+
+
+def test_dispersion_calibration_is_applied(fitted):
+    m, _, _ = fitted
+    before = m.forecast_components('test')['alpha'].mean()
+    tab = m.calibrate_dispersion('val')
+    assert {'alpha_scale', 'wis', 'cov95'} <= set(tab.columns)
+    assert m.alpha_scale == pytest.approx(tab.loc[tab['wis'].idxmin(), 'alpha_scale'])
+    after = m.forecast_components('test')['alpha'].mean()
+    assert after == pytest.approx(before * m.alpha_scale, rel=1e-5)
+    m.alpha_scale = 1.0                                       # leave the shared fixture unchanged
+
+
+def test_shuffle_makes_seeds_differ(fitted):
+    import copy
+    from src.dataloading.databuilders.graphdatabuilder.datacontainers import DataList
+
+    m, _, _ = fitted
+
+    def val_loss(seed, shuffle):
+        mm = copy.copy(m)
+        torch.manual_seed(seed)
+        mm.model = HHH4Module(N, S, H, [0], [1, 2], hidden_size=8, mu_init=float(m.model.scale),
+                              rate_dynamics='none')
+        mm.status_dict = {'model_hparams_set': True}
+        mm.config_info, mm.verbose, mm.strategy = {}, 0, Strategy()
+        mm.databuilder = SimpleNamespace(dataloader_train=DataList(m._get_dataloader('train')),
+                                         dataloader_val=DataList(m._get_dataloader('val')))
+        mm.set_global_hparams(lr=5e-3, n_epochs=2, patience=10, shuffle=shuffle)
+        mm.train()
+        return float(mm.monitoring_metrics['val_loss'].iloc[-1])
+
+    assert val_loss(0, False) == val_loss(1, False)          # deterministic model, fixed order
+    assert val_loss(0, True) != val_loss(1, True)            # shuffled order: seeds differ

@@ -145,6 +145,44 @@ def plot_component_shares(model, dataset: str = 'test', horizon: int = 0):
     return fig
 
 
+def plot_rate_multipliers(model, nodes=(0,), dataset: str = 'test', horizon: int = 0):
+    """
+    How the epidemic and neighbourhood rates change over the season (seasonal terms
+    x recurrent shift), with the truth and the forecast mean above for context.
+    A multiplier above 1 means the branch is amplified that week, e.g. in a growth
+    phase; below 1, damped, e.g. after the peak.
+    """
+    from .components import components_with_target_time
+
+    comp = components_with_target_time(model, dataset)
+    if 'epidemic_rate_multiplier' not in comp.columns:
+        raise ValueError('needs the rate forms (epidemic_mode / neighbourhood_mode = rate)')
+    comp = comp[comp['horizon'] == horizon]
+    nodes = [nodes] if isinstance(nodes, (int, np.integer)) else list(nodes)
+    id_col = model.epiconfig.id_column
+
+    fig, axes = plt.subplots(2, len(nodes), figsize=(6 * len(nodes), 6), squeeze=False, sharex='col',
+                             gridspec_kw={'height_ratios': [3, 2]})
+    for j, node in enumerate(nodes):
+        c = comp[comp[id_col] == node].sort_values('target_time')
+        top, bot = axes[0, j], axes[1, j]
+        top.plot(c['target_time'], c['target'], color=INK, lw=2, marker='o', ms=3, label='truth')
+        top.plot(c['target_time'], c['mu'], color=SERIES_COLORS[0], lw=2, label='forecast mean')
+        _style(top, _node_name(model, node), model.epiconfig.target_column)
+        top.legend(frameon=False, fontsize=9, loc='upper left')
+        bot.plot(c['target_time'], c['epidemic_rate_multiplier'], color=COMPONENT_COLORS['epidemic'],
+                 lw=2, label='epidemic')
+        bot.plot(c['target_time'], c['neighbourhood_rate_multiplier'], color=COMPONENT_COLORS['neighbourhood'],
+                 lw=2, label='neighbourhood')
+        bot.axhline(1, color=INK_MUTED, lw=1, ls='--')
+        bot.set_yscale('log')
+        _style(bot, 'Rate multiplier (log scale)', 'x rate')
+        bot.legend(frameon=False, fontsize=9, loc='upper left')
+    fig.suptitle(f'{model.name}: time-varying rates', x=0.01, ha='left', color=INK, fontsize=12)
+    fig.tight_layout()
+    return fig
+
+
 # --------------------------------------------------------------------------- #
 # parameters
 # --------------------------------------------------------------------------- #

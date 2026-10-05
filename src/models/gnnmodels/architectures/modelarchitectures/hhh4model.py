@@ -62,7 +62,12 @@ class HHH4Model(GNNModel):
                           node_effects:       bool  = True,
                           node_penalty:       float = 0.01,
                           neighbourhood_mode: Literal['rate', 'linear', 'gcn'] = 'rate',
-                          epidemic_mode:      Literal['rate', 'neural'] = 'rate'):
+                          epidemic_mode:      Literal['rate', 'neural'] = 'rate',
+                          seasonal_rates:     bool  = True,
+                          rate_dynamics:      Literal['none', 'gru', 'lstm'] = 'gru',
+                          dynamics_hidden:    int   = 16,
+                          max_log_rate_adj:   float = 3.0,
+                          dynamics_penalty:   float = 1e-3):
         """
         Parameters
         ----------
@@ -95,6 +100,17 @@ class HHH4Model(GNNModel):
         epidemic_mode : {'rate', 'neural'}
             ``'rate'`` (default): a rate times the lag-weighted own counts.
             ``'neural'``: softplus of a linear map (the first version).
+
+        seasonal_rates : bool
+            Seasonal (week-of-year) terms on the epidemic and neighbourhood rates.
+        rate_dynamics : {'none', 'gru', 'lstm'}
+            A recurrent unit reads the recent trajectory (own and neighbour counts,
+            and their weekly change) and shifts both rates per region and week, so
+            the model can follow fast growth and decline (influenza). ``'none'``
+            gives constant rates (plus the seasonal terms).
+        dynamics_hidden, max_log_rate_adj, dynamics_penalty
+            Hidden size of the recurrent unit; bound on its log-rate shift
+            (3.0 = rates scaled by up to e^3 = 20x either way); ridge penalty on it.
 
         The rate forms need non-negative, untransformed lag features: use
         ``target_column='cases', lag_column='cases'`` (case lags follow the raw
@@ -144,7 +160,13 @@ class HHH4Model(GNNModel):
             node_penalty  = node_penalty,
             neighbourhood_mode = neighbourhood_mode,
             epidemic_mode = epidemic_mode,
+            seasonal_rates = seasonal_rates,
+            rate_dynamics = rate_dynamics,
+            dynamics_hidden = dynamics_hidden,
+            max_log_rate_adj = max_log_rate_adj,
+            dynamics_penalty = dynamics_penalty,
         ).to(self.device)
+        self.alpha_scale = 1.0
 
         self.config_info['model_hparams'] = {
             'hidden_size':        hidden_size,
@@ -160,6 +182,11 @@ class HHH4Model(GNNModel):
             'node_penalty':       node_penalty,
             'neighbourhood_mode': neighbourhood_mode,
             'epidemic_mode':      epidemic_mode,
+            'seasonal_rates':     seasonal_rates,
+            'rate_dynamics':      rate_dynamics,
+            'dynamics_hidden':    dynamics_hidden,
+            'max_log_rate_adj':   max_log_rate_adj,
+            'dynamics_penalty':   dynamics_penalty,
         }
 
         self._update_status('model_hparams_set')
@@ -172,7 +199,9 @@ class HHH4Model(GNNModel):
         Per-branch NB means for every (t0, node, horizon), with their shares of mu.
 
         Columns: t0 timestamp, node, horizon, endemic, epidemic, neighbourhood,
-        mu, alpha, share_endemic, share_epidemic, share_neighbourhood, target.
+        mu, alpha, share_endemic, share_epidemic, share_neighbourhood, target, and
+        for the rate forms the time-varying rate multipliers
+        (epidemic_rate_multiplier, neighbourhood_rate_multiplier).
         """
         self._check_status(['model_hparams_set', 'trained'])
         comps, mu, alpha, y = self._collect_components(dataset)
@@ -193,6 +222,12 @@ class HHH4Model(GNNModel):
             for name in HHH4Module.component_names:
                 df[f'share_{name}'] = df[name] / df['mu']
             df['target'] = y[:, :, hh].reshape(-1)
+            mult = getattr(self, '_last_rate_multipliers', None)
+            if mult is not None:
+                # time-varying part of the rates (seasonal terms x recurrent shift);
+                # > 1: the branch is amplified in that week, e.g. in a growth phase
+                df['epidemic_rate_multiplier']      = mult[0][:, :, hh].reshape(-1)
+                df['neighbourhood_rate_multiplier'] = mult[1][:, :, hh].reshape(-1)
             frames.append(df)
 
         return pd.concat(frames, ignore_index=True)
@@ -222,6 +257,62 @@ class HHH4Model(GNNModel):
         return total.numpy(), {k: v.numpy() for k, v in parts.items()}
 
     # ======================================================================= #
+    # interval calibration
+    # ======================================================================= #
+    def calibrate_dispersion(self,
+                             dataset: DataSetSplit = 'val',
+                             season: str | None = 'in',
+                             scales=None) -> pd.DataFrame:
+        """
+        Choose one multiplier for the NB dispersion that minimises the WIS on
+        ``dataset`` (default: in-season weeks of the validation split), and use it
+        for all later forecasts.
+
+        The dispersion is fitted by the likelihood over all weeks, including the
+        noisy off-season, which can leave in-season intervals too wide (or too
+        narrow). This rescales the spread only; the mean is unchanged. It is the
+        NB counterpart of the conformal correction used for the other GNNs.
+        Call it after ``train()`` and before ``forecast()``. Returns the WIS and
+        coverage for every candidate multiplier.
+        """
+        from ....utils.intervalmetrics import wis, coverage_and_width, season_mask, season_weeks_for
+        from ..modules.hhh4module import nb_quantiles
+
+        self._check_status(['model_hparams_set', 'trained'])
+        q = self.epiconfig.quantiles
+        if q is None:
+            raise ValueError('calibrate_dispersion needs interval mode (EpiConfig.quantiles).')
+
+        old = getattr(self, 'alpha_scale', 1.0)
+        self.alpha_scale = 1.0
+        comp = self.forecast_components(dataset)
+        self.alpha_scale = old
+
+        if season is not None:
+            steps = self.epiconfig.horizon_leadtime + comp['horizon']
+            target_time = pd.to_datetime(comp[self.epiconfig.temporal_column]) + pd.to_timedelta(7 * steps, unit='D')
+            mask = season_mask(target_time, *season_weeks_for(self.epiconfig.disease)).to_numpy()
+            if season == 'off':
+                mask = ~mask
+            if mask.sum() > 0:
+                comp = comp[mask]
+
+        mu, alpha, y = comp['mu'].to_numpy(), comp['alpha'].to_numpy(), comp['target'].to_numpy()
+        scales = np.exp(np.linspace(np.log(0.02), np.log(50.0), 41)) if scales is None else np.asarray(scales)
+
+        rows = []
+        for c in scales:
+            qv = nb_quantiles(mu, alpha * c, q)
+            df = pd.DataFrame({'target': y, **{f'pred_q{i+1}': qv[:, i] for i in range(len(q))}})
+            cw = coverage_and_width(df, q)
+            rows.append({'alpha_scale': float(c), 'wis': float(wis(df, q).mean()),
+                         **{f"cov{int(round(n * 100))}": cv for n, cv in zip(cw['nominal'], cw['coverage'])}})
+        table = pd.DataFrame(rows)
+        self.alpha_scale = float(table.loc[table['wis'].idxmin(), 'alpha_scale'])
+        self.config_info['alpha_scale'] = self.alpha_scale
+        return table
+
+    # ======================================================================= #
     # helpers
     # ======================================================================= #
     def _collect_components(self, dataset: DataSetSplit):
@@ -229,6 +320,7 @@ class HHH4Model(GNNModel):
         self.model.eval()
         comps: dict[str, list[np.ndarray]] = {k: [] for k in HHH4Module.component_names}
         mus, alphas, ys = [], [], []
+        epi_mult, ne_mult = [], []
 
         with torch.no_grad():
             for snapshot in self._get_dataloader(dataset):
@@ -240,10 +332,15 @@ class HHH4Model(GNNModel):
                                                 return_components=True)
                 for k in comps:
                     comps[k].append(parts[k].cpu().numpy())
+                mult = getattr(self.model, 'last_rate_multipliers', None)
+                if mult is not None:
+                    epi_mult.append(mult[0].cpu().numpy())
+                    ne_mult.append(mult[1].cpu().numpy())
                 mus.append(mu.cpu().numpy())
-                alphas.append(alpha.cpu().numpy())
+                alphas.append(alpha.cpu().numpy() * getattr(self, 'alpha_scale', 1.0))
                 ys.append(snapshot.y.cpu().numpy())
 
+        self._last_rate_multipliers = (np.stack(epi_mult), np.stack(ne_mult)) if epi_mult else None
         return ({k: np.stack(v) for k, v in comps.items()},
                 np.stack(mus), np.stack(alphas), np.stack(ys))
 

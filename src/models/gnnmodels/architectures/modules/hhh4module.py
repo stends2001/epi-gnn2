@@ -13,6 +13,7 @@ from torch_geometric.utils import remove_self_loops, scatter
 EndemicMode       = Literal['loglinear', 'mlp']
 EpidemicMode      = Literal['rate', 'neural']
 NeighbourhoodMode = Literal['rate', 'linear', 'gcn']
+RateDynamics      = Literal['none', 'gru', 'lstm']
 
 
 def _inv_softplus(y: float) -> float:
@@ -44,6 +45,21 @@ class HHH4Module(nn.Module):
       node effects on those rates.
     - ``pi``, ``rho``: lag weights over the input window (softmax, sum to 1).
     - ``ybar_i``: edge-weighted mean of the neighbours' counts (self-loops removed).
+
+    Time-varying rates. Constant rates cannot follow an epidemic that grows several-
+    fold within the lead time and then collapses (influenza). Two additions, both
+    on the log-rate, so the rates stay positive and the branches interpretable::
+
+        l_ih(t) = l_h + sum_f s_fh x_f(t0)      +  g_h(GRU(own, neighbours)_i)
+                        seasonal rate terms        trajectory-driven adjustment
+
+    - ``seasonal_rates``: the epidemic and neighbourhood rates get their own
+      coefficients on the seasonal features (as in hhh4 for influenza).
+    - ``rate_dynamics='gru'|'lstm'``: a recurrent unit reads the recent window of
+      log own counts, log neighbour-mean counts and their week-on-week change, and
+      shifts both log-rates per node and week. It sees whether a region is in the
+      rising or falling phase. The shift is bounded (``max_log_rate_adj``) and
+      starts at 0, so training starts from the plain hhh4 form.
 
     Node deviations are centred over nodes and ridge-penalised (``regularization``),
     which pools regions with little data towards the shared values, like hhh4's
@@ -84,6 +100,18 @@ class HHH4Module(nn.Module):
         Node effects on the epidemic and neighbourhood rates.
     node_penalty : float
         Ridge penalty on the centred node deviations (mean of squares).
+    seasonal_rates : bool
+        Seasonal coefficients on the epidemic / neighbourhood log-rates.
+    rate_dynamics : {'none', 'gru', 'lstm'}
+        Recurrent, trajectory-driven adjustment of the log-rates (rate forms only).
+    dynamics_hidden : int
+        Hidden size of the GRU / LSTM.
+    max_log_rate_adj : float
+        Bound on the recurrent log-rate shift (default log(20): a rate can be scaled
+        by 1/20 to 20 within one forecast).
+    dynamics_penalty : float
+        Ridge penalty on the recurrent log-rate shifts (keeps them small unless
+        the data need them).
 
     Shapes
     ------
@@ -112,7 +140,12 @@ class HHH4Module(nn.Module):
                  node_effects:  bool  = True,
                  node_penalty:  float = 0.01,
                  neighbourhood_mode: NeighbourhoodMode = 'rate',
-                 epidemic_mode: EpidemicMode = 'rate'):
+                 epidemic_mode: EpidemicMode = 'rate',
+                 seasonal_rates: bool = True,
+                 rate_dynamics:  RateDynamics = 'gru',
+                 dynamics_hidden: int = 16,
+                 max_log_rate_adj: float = math.log(20.0),
+                 dynamics_penalty: float = 1e-3):
         super().__init__()
 
         if len(incidence_idx) == 0:
@@ -123,7 +156,8 @@ class HHH4Module(nn.Module):
         for name, val, ok in [('alpha_mode', alpha_mode, ('global', 'node')),
                               ('endemic_mode', endemic_mode, ('loglinear', 'mlp')),
                               ('epidemic_mode', epidemic_mode, ('rate', 'neural')),
-                              ('neighbourhood_mode', neighbourhood_mode, ('rate', 'linear', 'gcn'))]:
+                              ('neighbourhood_mode', neighbourhood_mode, ('rate', 'linear', 'gcn')),
+                              ('rate_dynamics', rate_dynamics, ('none', 'gru', 'lstm'))]:
             if val not in ok:
                 raise ValueError(f'{name} must be one of {ok}, got {val!r}')
 
@@ -137,6 +171,12 @@ class HHH4Module(nn.Module):
         self.neighbourhood_mode = neighbourhood_mode
         self.node_effects = node_effects
         self.node_penalty = node_penalty
+        has_rate = 'rate' in (epidemic_mode, neighbourhood_mode)
+        self.seasonal_rates = bool(seasonal_rates) and has_rate and len(endemic_idx) > 0
+        self.rate_dynamics  = rate_dynamics if has_rate else 'none'
+        self.max_log_rate_adj = float(max_log_rate_adj)
+        self.dynamics_penalty = float(dynamics_penalty)
+        self._last_rate_adj: torch.Tensor | None = None
 
         scale = float(mu_init) if mu_init is not None and mu_init > 0 else 1.0
         self.register_buffer('scale',         torch.tensor(scale))
@@ -197,6 +237,20 @@ class HHH4Module(nn.Module):
             with torch.no_grad():
                 self.ne_out.bias.fill_(_inv_softplus(third))
 
+        # ---- time-varying rates ----
+        if self.seasonal_rates:
+            self.epi_seas_coef = nn.Parameter(torch.zeros(n_end, horizon_size))     # s_fh (epidemic)
+            self.ne_seas_coef  = nn.Parameter(torch.zeros(n_end, horizon_size))     # s_fh (neighbourhood)
+        if self.rate_dynamics != 'none':
+            n_lag_feat = len(incidence_idx)
+            rnn_cls = nn.GRU if self.rate_dynamics == 'gru' else nn.LSTM
+            # per step: log own counts, log neighbour-mean counts, and their weekly change
+            self.dyn_rnn  = rnn_cls(input_size=4 * n_lag_feat, hidden_size=dynamics_hidden, batch_first=True)
+            self.dyn_head = nn.Linear(dynamics_hidden, 2 * horizon_size)
+            with torch.no_grad():                    # start exactly at the plain hhh4 form
+                self.dyn_head.weight.zero_()
+                self.dyn_head.bias.zero_()
+
         # ---- node effects on epidemic / neighbourhood ----
         if node_effects:
             self.epi_node_effect = nn.Parameter(torch.zeros(num_nodes))   # e_i
@@ -245,6 +299,35 @@ class HHH4Module(nn.Module):
         """Lag-weighted average per horizon: [N, K] x softmax([H, K]) -> [N, H]."""
         return h @ torch.softmax(logits, dim=-1).t()
 
+    def _rate_adjustments(self, x, x_inc, ei, ew) -> tuple[torch.Tensor, torch.Tensor]:
+        """Seasonal + recurrent log-rate shifts for epidemic and neighbourhood: [N, H] each."""
+        n = x.shape[0]
+        epi_adj = x_inc.new_zeros(n, self.horizon_size)
+        ne_adj  = x_inc.new_zeros(n, self.horizon_size)
+
+        if self.seasonal_rates:
+            z = x.index_select(1, self.endemic_idx)[:, :, -1]                   # [N, F] at t0
+            epi_adj = epi_adj + z @ self.epi_seas_coef
+            ne_adj  = ne_adj  + z @ self.ne_seas_coef
+
+        self._last_rate_adj = None
+        if self.rate_dynamics != 'none':
+            k = self.incidence_idx.numel()
+            own = x_inc.clamp(min=0).view(n, k, self.seq_length)                # [N, K, S]
+            nbm = self._neighbour_mean(x_inc.clamp(min=0), ei, ew).view(n, k, self.seq_length)
+            lo, ln = torch.log1p(own), torch.log1p(nbm)
+            d_lo = torch.diff(lo, dim=-1, prepend=lo[..., :1])                  # weekly change
+            d_ln = torch.diff(ln, dim=-1, prepend=ln[..., :1])
+            seq = torch.cat([lo, ln, d_lo, d_ln], dim=1).transpose(1, 2)        # [N, S, 4K]
+            out, _ = self.dyn_rnn(seq)
+            shift = self.max_log_rate_adj * torch.tanh(self.dyn_head(out[:, -1]))   # [N, 2H]
+            self._last_rate_adj = shift
+            epi_adj = epi_adj + shift[:, :self.horizon_size]
+            ne_adj  = ne_adj  + shift[:, self.horizon_size:]
+        # kept for explanation: rate multipliers exp(adj) of the latest forward pass
+        self.last_rate_multipliers = (torch.exp(epi_adj).detach(), torch.exp(ne_adj).detach())
+        return epi_adj, ne_adj
+
     def _node_mult(self, p: torch.Tensor) -> torch.Tensor:
         return torch.exp(self._centered(p)).view(-1, 1)
 
@@ -271,13 +354,15 @@ class HHH4Module(nn.Module):
 
         scale = self.scale
         x_inc = self._select(x, self.incidence_idx) / scale
+        ei, ew = remove_self_loops(edge_index, edge_weight)
 
         endemic = self._endemic(x) * scale
+        epi_adj, ne_adj = self._rate_adjustments(x, x_inc, ei, ew)
 
         # ---- epidemic (own region) ----
         if self.epidemic_mode == 'rate':
             own = self._lagged(x_inc.clamp(min=0), self.epi_lag_logits)
-            epidemic = torch.exp(self.epi_log_rate).view(1, -1) * own * scale
+            epidemic = torch.exp(self.epi_log_rate.view(1, -1) + epi_adj) * own * scale
         else:
             epidemic = F.softplus(self.epidemic(x_inc)) * scale
 
@@ -285,10 +370,9 @@ class HHH4Module(nn.Module):
         # strip any self-loops already in the graph: GCNConv's add_self_loops=False only
         # stops it from ADDING loops, and a weighted mean over a self-loop would also leak
         # the node's own incidence into this branch.
-        ei, ew = remove_self_loops(edge_index, edge_weight)
         if self.neighbourhood_mode == 'rate':
             nb = self._lagged(self._neighbour_mean(x_inc.clamp(min=0), ei, ew), self.ne_lag_logits)
-            neighbourhood = torch.exp(self.ne_log_rate).view(1, -1) * nb * scale
+            neighbourhood = torch.exp(self.ne_log_rate.view(1, -1) + ne_adj) * nb * scale
         elif self.neighbourhood_mode == 'linear':
             neighbourhood = F.softplus(self.ne_out(self._neighbour_mean(x_inc, ei, ew))) * scale
         else:
@@ -321,9 +405,12 @@ class HHH4Module(nn.Module):
         if self.node_effects:
             terms.append(self._centered(self.epi_node_effect).pow(2).mean())
             terms.append(self._centered(self.ne_node_effect).pow(2).mean())
-        if not terms or self.node_penalty == 0:
-            return self.log_alpha.new_zeros(())
-        return self.node_penalty * torch.stack(terms).sum()
+        total = self.log_alpha.new_zeros(())
+        if terms and self.node_penalty > 0:
+            total = total + self.node_penalty * torch.stack(terms).sum()
+        if self._last_rate_adj is not None and self.dynamics_penalty > 0:
+            total = total + self.dynamics_penalty * self._last_rate_adj.pow(2).mean()
+        return total
 
     @torch.no_grad()
     def node_parameters(self) -> dict[str, np.ndarray]:
@@ -360,6 +447,10 @@ class HHH4Module(nn.Module):
         if self.neighbourhood_mode == 'rate':
             out['neighbourhood_rate'] = (ne_mult.view(-1, 1) * torch.exp(self.ne_log_rate).view(1, -1)).cpu().numpy()
             out['neighbourhood_lag_weights'] = torch.softmax(self.ne_lag_logits, -1).cpu().numpy()
+
+        if self.seasonal_rates:
+            out['epidemic_seasonal_coef']      = self.epi_seas_coef.cpu().numpy()
+            out['neighbourhood_seasonal_coef'] = self.ne_seas_coef.cpu().numpy()
 
         out['epidemic_multiplier']      = epi_mult.cpu().numpy()
         out['neighbourhood_multiplier'] = ne_mult.cpu().numpy()
