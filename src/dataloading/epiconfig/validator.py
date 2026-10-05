@@ -87,11 +87,23 @@ class EpiConfigValidator:
                     if q <= 0 or q >= 1:
                         exceptions.append(EpiConfigValidationError(f'Quantiles must be decimals: between 0 and 1. Got {q}')) 
 
-                n_intervals = len(self.epiconfig.quantiles) // 2
-                mid = n_intervals
+                qs  = list(self.epiconfig.quantiles)
+                mid = len(qs) // 2
 
-                if self.epiconfig.quantiles[mid] != 0.5:
-                    exceptions.append(EpiConfigValidationError(f'Number of quantiles must be an odd number centered around 0.5.'))                     
+                if len(qs) % 2 == 0 or abs(qs[mid] - 0.5) > 1e-9:
+                    exceptions.append(EpiConfigValidationError(f'Number of quantiles must be an odd number centered around 0.5.'))
+
+                # strictly increasing: the metrics, the monotone quantile head and the
+                # interval plots all assume pred_q1 < ... < pred_qN
+                if any(b <= a for a, b in zip(qs[:-1], qs[1:])):
+                    exceptions.append(EpiConfigValidationError(f'Quantiles must be strictly increasing. Got {qs}'))
+
+                # symmetric pairs: q_i + q_{N-1-i} == 1, so that each (lower, upper) pair
+                # forms a central interval with nominal coverage 1 - 2 * q_i (used by WIS)
+                for i in range(mid):
+                    if abs(qs[i] + qs[-1 - i] - 1.0) > 1e-9:
+                        exceptions.append(EpiConfigValidationError(
+                            f'Quantiles must be symmetric around 0.5: {qs[i]} and {qs[-1 - i]} do not sum to 1.'))
 
             if self.epiconfig._num_quantiles is None:
                 exceptions.append(EpiConfigValidationError(f'``_prediction_mode`` == "interval". Excpected ``_num_quantiles`` as integer but got ``None``')) 
