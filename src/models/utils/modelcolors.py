@@ -4,6 +4,9 @@ model_colors = {
     # baseline:
     'persistence'  : "#888888",
     'seasonalaverage'   : "#595959",    
+
+    'gcnmodel' : 'blue',
+    'nodemlpmodel' : 'darkgreen'
 }
 
 def color_is_light(color: str, threshold=0.6):

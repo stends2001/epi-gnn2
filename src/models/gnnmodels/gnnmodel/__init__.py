@@ -1,0 +1,1 @@
+from .gnnmodel import GNNModel

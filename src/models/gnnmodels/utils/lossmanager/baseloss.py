@@ -51,5 +51,6 @@ class BaseLoss(nn.Module, ABC):
     def __repr__(self) -> str:
         kwargs_str = ', '.join(f"{k}={v}" for k, v in self.kwargs.items())
         return f"{self.__class__.__name__}({kwargs_str})"
-    
+
+from .nbloss import NBLoss
 from .losses import MSELoss

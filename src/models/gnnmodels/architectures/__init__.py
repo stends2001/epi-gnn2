@@ -1,0 +1,1 @@
+from .modelarchitectures import GCNModel, GATModel
