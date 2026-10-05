@@ -73,9 +73,9 @@ class NBLoss(BaseLoss):
                              n_samples: int = 2000) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Monte-Carlo prediction interval for the NB2 distribution defined
-        by `(mu, alpha)`, for coverage/sharpness evaluation. Sampling is
-        used rather than the (unstable, non-closed-form) analytic
-        NB quantile function.
+        by `(mu, alpha)`. For forecasts, ``hhh4module.nb_quantiles`` gives the
+        exact quantiles (scipy ``nbinom.ppf``) and is what ``forecast()`` uses;
+        this sampler is kept as a cross-check.
 
         Parameters
         ----------

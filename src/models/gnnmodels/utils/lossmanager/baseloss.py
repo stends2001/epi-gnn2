@@ -54,3 +54,4 @@ class BaseLoss(nn.Module, ABC):
 
 from .nbloss import NBLoss
 from .losses import MSELoss
+from .pinballloss import PinballLoss

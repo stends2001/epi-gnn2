@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from .quantilehead import MonotoneQuantileHead
 from torch_geometric.nn import GCNConv
 
 class GCNModule(nn.Module):
@@ -29,6 +30,11 @@ class GCNModule(nn.Module):
         number of sequences in dataloader-snapshot
     horizon_size: int
         number of steps to predict
+    quantiles: list[float] | None
+        if given, the output is a set of non-crossing quantiles per horizon
+        (``MonotoneQuantileHead``) of shape [num_nodes, horizon_size, num_quantiles],
+        to be trained with the pinball loss. If None, a point forecast of shape
+        [num_nodes, horizon_size].
 
     Forward
     -------
@@ -57,7 +63,8 @@ class GCNModule(nn.Module):
                  num_features:  int,
                  num_nodes:     int,
                  seq_length:    int,
-                 horizon_size:  int):
+                 horizon_size:  int,
+                 quantiles:     list[float] | None = None):
 
         super().__init__()
 
@@ -74,6 +81,7 @@ class GCNModule(nn.Module):
         self.num_nodes      = num_nodes
         self.seq_length     = seq_length
         self.horizon_size   = horizon_size
+        self.quantiles      = list(quantiles) if quantiles is not None else None
 
         flat_features = num_features * seq_length
 
@@ -98,8 +106,11 @@ class GCNModule(nn.Module):
         self.norms  = nn.ModuleList(norms)
         self.dropout= nn.Dropout(self.dropout_p)
 
-        # Output projection: linear layer [hidden_size] → [horizon * quantiles]
-        self.output_proj = nn.Linear(hidden_size, horizon_size)
+        # Output projection: [hidden_size] → [horizon] (point) or [horizon, quantiles]
+        if self.quantiles is None:
+            self.output_proj = nn.Linear(hidden_size, horizon_size)
+        else:
+            self.output_proj = MonotoneQuantileHead(hidden_size, horizon_size, self.quantiles)
 
     def forward(self,
                 x:              torch.Tensor,
@@ -133,7 +144,11 @@ class GCNModule(nn.Module):
         h_out = h
 
         # Project to forecasts
-        output = self.output_proj(h_out)                                                # [num_nodes, horizon_size]
-        output = output.view(self.num_nodes, self.horizon_size)                         # [num_nodes, horizon_size] 
+        output = self.output_proj(h_out)
+
+        if self.quantiles is None:
+            output = output.view(self.num_nodes, self.horizon_size)                     # [num_nodes, horizon_size]
+        else:
+            output = output.view(self.num_nodes, self.horizon_size, len(self.quantiles)) # [num_nodes, horizon_size, num_quantiles]
 
         return output
