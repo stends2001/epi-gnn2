@@ -1,0 +1,188 @@
+"""
+Interval / quantile forecast metrics.
+
+All functions take a prediction frame with the columns ``target`` and
+``pred_q1 ... pred_qN`` (as stored by ``PredictionManager``) and the matching,
+validated quantile levels (odd, sorted, symmetric around 0.5).
+
+Metrics
+-------
+- WIS (weighted interval score; Bracher et al. 2021, PLoS Comput Biol):
+      WIS = 1 / (K + 1/2) * ( 1/2 * |y - median| + sum_k alpha_k / 2 * IS_alpha_k )
+  with K central intervals at alpha_k = 2 * q_k and the interval score
+      IS_alpha = (u - l) + 2/alpha * (l - y) * 1[y < l] + 2/alpha * (y - u) * 1[y > u].
+  WIS equals 1 / (K + 1/2) times the summed pinball loss over all 2K + 1
+  levels, and approximates the CRPS when there are many levels.
+- Empirical coverage and mean width per central interval (nominal 1 - 2 q_k).
+- PIT-style quantile ranks: the fraction of quantile levels below the target.
+  For a calibrated forecast, the ranks are roughly uniform.
+
+Report these per horizon and per node group, not only pooled: pooled coverage can
+look fine while large and small regions are mis-covered in opposite directions.
+"""
+from __future__ import annotations
+
+from typing import Iterable
+
+import numpy as np
+import pandas as pd
+
+
+def _quantile_matrix(df: pd.DataFrame, quantiles: list[float]) -> np.ndarray:
+    cols = [f'pred_q{i+1}' for i in range(len(quantiles))]
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise KeyError(f'prediction frame is missing quantile columns {missing}')
+    return df[cols].to_numpy(dtype=float)
+
+
+def _check_quantiles(quantiles: list[float]) -> None:
+    q = np.asarray(quantiles, dtype=float)
+    mid = len(q) // 2
+    if len(q) % 2 == 0 or abs(q[mid] - 0.5) > 1e-9:
+        raise ValueError('quantiles must be odd-length with 0.5 in the middle')
+    if not np.allclose(q + q[::-1], 1.0):
+        raise ValueError('quantiles must be symmetric around 0.5')
+
+
+def interval_score(lower: np.ndarray, upper: np.ndarray, y: np.ndarray, alpha: float) -> np.ndarray:
+    """Interval score of the central (1 - alpha) interval, per row."""
+    return ((upper - lower)
+            + 2.0 / alpha * np.clip(lower - y, 0, None)
+            + 2.0 / alpha * np.clip(y - upper, 0, None))
+
+
+def wis(df: pd.DataFrame, quantiles: list[float], decompose: bool = False) -> pd.Series | pd.DataFrame:
+    """
+    Weighted interval score per row.
+
+    With ``decompose=True`` returns a frame with ``wis`` and its three parts:
+    ``dispersion`` (width), ``underprediction`` and ``overprediction``
+    (penalties for y above / below the intervals), which sum to ``wis``.
+    """
+    _check_quantiles(quantiles)
+    Q   = _quantile_matrix(df, quantiles)
+    y   = df['target'].to_numpy(dtype=float)
+    K   = len(quantiles) // 2
+    med = Q[:, K]
+
+    disp  = np.zeros_like(y)
+    under = 0.5 * np.clip(y - med, 0, None)     # median term split by side
+    over  = 0.5 * np.clip(med - y, 0, None)
+
+    for k in range(K):
+        alpha = 2.0 * quantiles[k]
+        l, u  = Q[:, k], Q[:, -1 - k]
+        w     = alpha / 2.0
+        disp  += w * (u - l)
+        under += w * 2.0 / alpha * np.clip(y - u, 0, None)
+        over  += w * 2.0 / alpha * np.clip(l - y, 0, None)
+
+    norm  = 1.0 / (K + 0.5)
+    total = norm * (disp + under + over)
+
+    if not decompose:
+        return pd.Series(total, index=df.index, name='wis')
+    return pd.DataFrame({'wis'            : total,
+                         'dispersion'     : norm * disp,
+                         'underprediction': norm * under,
+                         'overprediction' : norm * over}, index=df.index)
+
+
+def coverage_and_width(df: pd.DataFrame, quantiles: list[float]) -> pd.DataFrame:
+    """
+    Empirical coverage and mean width per central interval.
+
+    Returns one row per interval with ``nominal``, ``coverage``, ``width``,
+    ``below`` (share of y under the lower bound) and ``above``.
+    """
+    _check_quantiles(quantiles)
+    Q = _quantile_matrix(df, quantiles)
+    y = df['target'].to_numpy(dtype=float)
+    K = len(quantiles) // 2
+
+    rows = []
+    for k in range(K):
+        l, u = Q[:, k], Q[:, -1 - k]
+        rows.append({
+            'lower_q' : quantiles[k],
+            'upper_q' : quantiles[-1 - k],
+            'nominal' : 1.0 - 2.0 * quantiles[k],
+            'coverage': float(np.mean((y >= l) & (y <= u))),
+            'below'   : float(np.mean(y < l)),
+            'above'   : float(np.mean(y > u)),
+            'width'   : float(np.mean(u - l)),
+        })
+    return pd.DataFrame(rows)
+
+
+def quantile_ranks(df: pd.DataFrame, quantiles: list[float]) -> pd.Series:
+    """
+    Fraction of predicted quantiles strictly below the target, per row. A
+    discrete PIT: histogram it; a U shape means intervals too narrow, a hump
+    too wide, a slope a biased median.
+    """
+    Q = _quantile_matrix(df, quantiles)
+    y = df['target'].to_numpy(dtype=float)[:, None]
+    return pd.Series((Q < y).mean(axis=1), index=df.index, name='quantile_rank')
+
+
+def summarize_intervals(df: pd.DataFrame,
+                        quantiles: list[float],
+                        group_cols: Iterable[str] | None = None) -> pd.DataFrame:
+    """
+    WIS (with decomposition), coverage and width, pooled or per group.
+
+    Returns one row per (group, interval) with columns: group columns,
+    nominal, coverage, below, above, width, wis, dispersion, underprediction,
+    overprediction, n.
+    """
+    group_cols = list(group_cols or [])
+    scores = wis(df, quantiles, decompose=True)
+    data   = pd.concat([df, scores], axis=1)
+
+    def _one(g: pd.DataFrame) -> pd.DataFrame:
+        cw = coverage_and_width(g, quantiles)
+        for c in ['wis', 'dispersion', 'underprediction', 'overprediction']:
+            cw[c] = float(g[c].mean())
+        cw['n'] = len(g)
+        return cw
+
+    if not group_cols:
+        return _one(data)
+
+    parts = []
+    for key, g in data.groupby(group_cols, sort=True):
+        out = _one(g)
+        key = key if isinstance(key, tuple) else (key,)
+        for c, v in zip(group_cols, key):
+            out.insert(0, c, v)
+        parts.append(out)
+    return pd.concat(parts, ignore_index=True)
+
+
+def evaluate_model_intervals(model,
+                             dataset: str = 'test',
+                             is_original: bool = True,
+                             group_cols: Iterable[str] | None = None) -> pd.DataFrame:
+    """
+    ``summarize_intervals`` for every horizon of a forecasted model, on the
+    original scale by default. Adds a ``horizon`` column.
+
+    ``group_cols`` may include the node column (``EpiConfig.id_column``) for
+    per-node coverage, or a column you merged in yourself (e.g. a size class).
+    """
+    quantiles = model.epiconfig.quantiles
+    if quantiles is None:
+        raise ValueError('model was not run in interval mode (EpiConfig.quantiles is None)')
+
+    coll  = model.predictions.get_preds(dataset)
+    parts = []
+    for hh in coll.horizons:
+        df  = coll.get(hh, is_original, False)
+        out = summarize_intervals(df, quantiles, group_cols)
+        out.insert(0, 'horizon', hh)
+        parts.append(out)
+    res = pd.concat(parts, ignore_index=True)
+    res.insert(0, 'model', model.name)
+    return res
